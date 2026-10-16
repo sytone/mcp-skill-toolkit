@@ -1,5 +1,12 @@
 # MCP Skill Toolkit
 
+This toolkit is the recommended way to work with MCP tools in
+[BotNexus](https://github.com/sytone/botnexus). Generate skills and PowerShell
+wrappers, then have agents call those wrappers through MCP CLI.
+
+See the [BotNexus skills guide](https://sytone.dev/botnexus/skills.html) and
+[Creating a skill](docs/creating-skills.md) for setup and usage.
+
 Generate agent skills and PowerShell tool wrappers from MCP servers using
 [philschmid/mcp-cli](https://github.com/philschmid/mcp-cli).
 
