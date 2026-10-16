@@ -48,6 +48,8 @@ if (-not $psake.build_success) {
                 $env:MCP_CLI_PSAKE_FILE = $BuildFile
                 $env:MCP_CLI_PSAKE_TASK = $Task
                 $env:MCP_CLI_PSAKE_PROPERTIES = $safeProperties | ConvertTo-Json -Compress
+                # Negative-path tests inspect the child exit code themselves.
+                $PSNativeCommandUseErrorActionPreference = $false
                 $output = & pwsh -NoLogo -NoProfile -Command $command 2>&1
                 [pscustomobject]@{
                     ExitCode = $LASTEXITCODE
@@ -104,8 +106,11 @@ if (-not $psake.build_success) {
         $sourceRoot = Join-Path $tempRoot 'source'
         $packagePath = Join-Path $tempRoot 'mcp-cli-setup.zip'
         $publicFiles = @(
-            '.gitignore', '.gitattributes', 'init.ps1', 'psakefile.ps1', 'README.md', 'docs/creating-skills.md', 'servers.example.json',
-            'tests/Build.Tests.ps1', 'tests/Init.Tests.ps1', 'tests/fixtures/servers.json'
+            '.gitignore', '.gitattributes', 'init.ps1', 'psakefile.ps1', 'README.md', 'AGENTS.md',
+            'docs/creating-skills.md', 'docs/testing.md', 'servers.example.json', 'scripts/Invoke-Tests.ps1',
+            'tests/Build.Tests.ps1', 'tests/Init.Tests.ps1', 'tests/Unit.Tests.ps1',
+            'tests/Wrappers.Tests.ps1', 'tests/Integration.Tests.ps1', 'tests/Runner.Tests.ps1',
+            'tests/fixtures/servers.json', 'tests/fixtures/fake-mcp-cli.ps1'
         )
         $privateFiles = @(
             'servers.json', 'servers.local.json', 'config.json', 'config/private.json',
@@ -454,7 +459,10 @@ Describe 'MCP CLI relative path resolution' {
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
                 $node.Name -in @('Resolve-UserPath', 'Resolve-BuildPath')
         }, $false)
-        . ([scriptblock]::Create(($definitions.Extent.Text -join [Environment]::NewLine)))
+        foreach ($definition in $definitions) {
+            # Retain original file/line metadata for Pester coverage.
+            Set-Item -Path ('Function:' + $definition.Name) -Value $definition.Body.GetScriptBlock()
+        }
     }
 
     It 'uses the PowerShell filesystem location rather than the process directory' {
@@ -507,7 +515,9 @@ Describe 'MCP CLI offline build regressions' -Tag 'OfflineRegression' {
         if ($definitions.Count -ne $functionNames.Count) {
             throw 'Expected offline build function definitions were not found.'
         }
-        . ([scriptblock]::Create(($definitions.Extent.Text -join [Environment]::NewLine)))
+        foreach ($definition in $definitions) {
+            Set-Item -Path ('Function:' + $definition.Name) -Value $definition.Body.GetScriptBlock()
+        }
 
         $tasks = @($ast.FindAll({
             param($node)

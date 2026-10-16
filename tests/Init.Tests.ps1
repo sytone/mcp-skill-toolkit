@@ -19,7 +19,10 @@ Describe 'MCP CLI initializer helpers' {
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
         }, $false)
-        . ([scriptblock]::Create(($definitions.Extent.Text -join [Environment]::NewLine)))
+        foreach ($definition in $definitions) {
+            # Preserve source locations without executing the installer body.
+            Set-Item -Path ('Function:' + $definition.Name) -Value $definition.Body.GetScriptBlock()
+        }
 
         $script:WriteConfig = {
             param([hashtable]$Config)
