@@ -1,0 +1,38 @@
+{
+  "mcp_cli_path": "mcp-cli",
+  "servers": {
+    "calendar": {
+      "command": ["agency", "mcp", "calendar"],
+      "default_port": 3456,
+      "description": "Microsoft Calendar MCP server",
+      "transport": "stdio",
+      "enabled": true
+    },
+    "ado-example": {
+      "exe_name": "ado",
+      "command": ["agency", "mcp", "ado", "--organization", "example-org"],
+      "description": "Azure DevOps for the example-org organization",
+      "transport": "stdio",
+      "enabled": false
+    },
+    "remote-demo": {
+      "command": ["agency", "mcp", "remote", "remote-demo"],
+      "description": "Remote demonstration MCP server",
+      "transport": "stdio",
+      "enabled": true
+    },
+    "web-search": {
+      "command": ["npx", "-y", "@zhafron/mcp-web-search", "--transport", "stdio"],
+      "description": "Web Search MCP server",
+      "transport": "stdio",
+      "enabled": true
+    },
+    "graph": {
+      "command": ["agency", "mcp", "graph"],
+      "default_port": 3456,
+      "description": "Microsoft Graph MCP server",
+      "transport": "stdio",
+      "enabled": false
+    }
+  }
+}

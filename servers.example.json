@@ -1,0 +1,30 @@
+{
+  "mcp_cli_path": "mcp-cli",
+  "servers": {
+    "everything": {
+      "command": [
+        "cmd",
+        "/c",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-everything"
+      ],
+      "description": "MCP protocol test tools. Use for testing tool discovery, generated wrappers, and example skill packages.",
+      "transport": "stdio",
+      "enabled": true
+    },
+    "local-http-example": {
+      "command": [
+        "node",
+        "server.js",
+        "--port",
+        "{port}"
+      ],
+      "description": "Placeholder for an already running local HTTP MCP server. Configure your own endpoint before enabling.",
+      "default_port": 3500,
+      "endpoint": "/mcp",
+      "transport": "http",
+      "enabled": false
+    }
+  }
+}
