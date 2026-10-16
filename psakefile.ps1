@@ -78,11 +78,19 @@ function New-SetupArchive {
         'init.ps1',
         'psakefile.ps1',
         'README.md',
+        'AGENTS.md',
         'docs/creating-skills.md',
+        'docs/testing.md',
         'servers.example.json',
+        'scripts/Invoke-Tests.ps1',
         'tests/Build.Tests.ps1',
         'tests/Init.Tests.ps1',
-        'tests/fixtures/servers.json'
+        'tests/Unit.Tests.ps1',
+        'tests/Wrappers.Tests.ps1',
+        'tests/Integration.Tests.ps1',
+        'tests/Runner.Tests.ps1',
+        'tests/fixtures/servers.json',
+        'tests/fixtures/fake-mcp-cli.ps1'
     )
     $archive = [IO.Compression.ZipFile]::Open($archivePath, [IO.Compression.ZipArchiveMode]::Create)
     try {
@@ -434,6 +442,9 @@ function Get-SourceServerMap {
 
     $allServers = @{}
     foreach ($property in $serversProperty.Value.PSObject.Properties) {
+        if ($property.Name -notmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$' -or $property.Name.Length -gt 64) {
+            throw "Invalid server name: $($property.Name). Use lowercase letters, digits, and single hyphens (max 64 characters)."
+        }
         $allServers[$property.Name] = $property.Value
     }
 
@@ -587,6 +598,9 @@ function ConvertTo-McpCliConfig {
     $mcpServers = [ordered]@{}
     foreach ($property in $ConfigObject.servers.PSObject.Properties) {
         $serverName = $property.Name
+        if ($serverName -notmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$' -or $serverName.Length -gt 64) {
+            throw "Invalid server name: $serverName. Use lowercase letters, digits, and single hyphens (max 64 characters)."
+        }
         $serverConfig = $property.Value
         $enabled = $true
         if ($null -ne $serverConfig.PSObject.Properties['enabled']) {
@@ -867,8 +881,8 @@ if ([string]::IsNullOrWhiteSpace($payload)) {
 }
 
 try {
-    $parsedPayload = $payload | ConvertFrom-Json -Depth 100
-    $payload = $parsedPayload | ConvertTo-Json -Depth 100 -Compress
+    $parsedPayload = ConvertFrom-Json -InputObject $payload -Depth 100 -NoEnumerate
+    $payload = ConvertTo-Json -InputObject $parsedPayload -Depth 100 -Compress
 }
 catch {
     throw "Invalid JSON payload for ${Tool}: $($_.Exception.Message)"
@@ -891,25 +905,33 @@ exit $exitCode
     $runner = $runnerTemplate.Replace('{{HEADER}}', $runnerHeader).Replace('{{SERVER_NAME}}', $serverLiteral).Replace('{{CONFIG_REFERENCE}}', $configExpression).Replace('{{MCP_CLI_PATH}}', $mcpCliExpression)
     $runner | Set-Content -Encoding UTF8 -Path (Join-Path $ScriptsDir 'Invoke-Tool.ps1')
 
-    $reservedParameterNames = @('Json', 'JsonPath')
+    $reservedParameterNames = @(
+        'Json', 'JsonPath', 'PSBoundParameters', 'PSScriptRoot', 'PSCommandPath',
+        'args', 'input', 'this', 'null', 'true', 'false', 'HOME', 'PID', 'Host',
+        'Error', 'ExecutionContext', 'PSVersionTable'
+    )
+    $generatedToolNames = @('Invoke-Tool')
     foreach ($tool in @($ToolMetadata)) {
         $toolName = [string]$tool.Name
-        if ($toolName -notmatch '^[A-Za-z_][A-Za-z0-9_-]*$') {
+        if ($toolName -notmatch '^[A-Za-z_][A-Za-z0-9_-]*$' -or $generatedToolNames -contains $toolName) {
             continue
         }
+        $generatedToolNames += $toolName
 
         $toolLiteral = ConvertTo-PowerShellSingleQuoted -Text $toolName
         $parameterDeclarations = New-Object System.Collections.Generic.List[string]
         [void]$parameterDeclarations.Add('    [string]$Json')
         [void]$parameterDeclarations.Add('    [string]$JsonPath')
 
+        $declaredParameterNames = @()
         foreach ($parameterName in @($tool.Parameters)) {
             if ($parameterName -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
                 continue
             }
-            if ($reservedParameterNames -contains $parameterName) {
+            if ($reservedParameterNames -contains $parameterName -or $declaredParameterNames -contains $parameterName) {
                 continue
             }
+            $declaredParameterNames += $parameterName
             [void]$parameterDeclarations.Add("    [object]`$$parameterName")
         }
 
@@ -921,8 +943,8 @@ exit $exitCode
 
 $ErrorActionPreference = 'Stop'
 
-$runner = Join-Path $PSScriptRoot 'Invoke-Tool.ps1'
-$runnerArgs = @{
+$mcpToolkitRunner = Join-Path $PSScriptRoot 'Invoke-Tool.ps1'
+$mcpToolkitRunnerArguments = @{
     Tool = {{TOOL_NAME}}
 }
 
@@ -931,23 +953,19 @@ if ($PSBoundParameters.ContainsKey('Json') -and $PSBoundParameters.ContainsKey('
 }
 
 if ($PSBoundParameters.ContainsKey('Json')) {
-    $runnerArgs.Json = $Json
+    $mcpToolkitRunnerArguments.Json = $Json
 }
 elseif ($PSBoundParameters.ContainsKey('JsonPath')) {
-    $runnerArgs.JsonPath = $JsonPath
+    $mcpToolkitRunnerArguments.JsonPath = $JsonPath
 }
 else {
-    $commonKeys = @('Json', 'JsonPath')
-    $payload = [ordered]@{}
-    foreach ($entry in $PSBoundParameters.GetEnumerator()) {
-        if ($commonKeys -notcontains $entry.Key) {
-            $payload[$entry.Key] = $entry.Value
-        }
+    if (@($PSBoundParameters.Keys).Length -gt 0) {
+        $mcpToolkitRunnerArguments.Json = ($PSBoundParameters | ConvertTo-Json -Depth 100 -Compress)
     }
-    $runnerArgs.Json = ($payload | ConvertTo-Json -Depth 100 -Compress)
+    # With no named payload, let the generic runner read stdin or default to {}.
 }
 
-& $runner @runnerArgs
+& $mcpToolkitRunner @mcpToolkitRunnerArguments
 exit $LASTEXITCODE
 '@
 
