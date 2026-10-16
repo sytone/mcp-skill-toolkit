@@ -145,15 +145,26 @@ explicitly for another agent runtime's skills directory.
 ## Tests
 
 ```powershell
-Import-Module psake -RequiredVersion 5.0.4
-Import-Module Pester -RequiredVersion 5.7.1
-Invoke-psake -TaskList Test
-if (-not $psake.build_success) { throw 'Tests failed.' }
+pwsh -NoProfile -File ./init.ps1 -SkipMcpCli
+pwsh -NoProfile -File ./scripts/Invoke-Tests.ps1 -Coverage
 ```
 
-The suite uses fixtures and task-local directories. It does not require live
-MCP servers, Agency access, or your local `servers.json`. Initialization and the
-`Test` task use Pester 5.7.1; Pester 6 is not part of the supported test setup.
+The suite uses fixtures, a local fake CLI, and task-local directories. It does
+not require live MCP servers, Agency access, or your local `servers.json`.
+Pester 5.7.1 is pinned; run the command in a fresh process to avoid conflicts
+with other Pester versions. `Invoke-psake -TaskList Test` remains available.
+
+[GitHub Actions](https://github.com/sytone/mcp-skill-toolkit/actions/workflows/tests.yml)
+runs the offline suite and enforces at least 75% command coverage on every push
+and pull request. Test and coverage reports are uploaded as workflow artifacts.
+See [Testing](docs/testing.md) for scope, limitations, and report locations.
+
+## Contributing
+
+Read [AGENTS.md](AGENTS.md) for contributor and agent guidance. Keep changes
+focused, add regression tests, and submit a pull request with passing checks.
+Never include local configuration, internal inventories, credentials, or
+generated skills in a contribution.
 
 ## Tasks and properties
 
@@ -203,5 +214,9 @@ init.ps1                   Dependency initialization and local CLI paths
 psakefile.ps1              Build, discovery, generation, deployment, packaging
 servers.example.json       Portable sample configuration
 docs/creating-skills.md    Skill creation and customization workflow
+docs/testing.md            Test commands, coverage scope, and limitations
+AGENTS.md                  Contributor and agent instructions
+scripts/Invoke-Tests.ps1    Shared local/CI test runner
+.github/workflows/         GitHub Actions workflow
 tests/                     Offline Pester tests and fixtures
 ```

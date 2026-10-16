@@ -42,7 +42,10 @@ function Install-RequiredModule {
         Write-InitLog "Installing $Name..."
         Install-Module @installArguments
         $installed = Get-Module -ListAvailable -Name $Name |
-            Where-Object { $null -eq $RequiredVersion -or $_.Version -eq $RequiredVersion } |
+            Where-Object {
+                if ($null -ne $RequiredVersion) { $_.Version -eq $RequiredVersion }
+                else { $_.Version -ge $MinimumVersion }
+            } |
             Sort-Object Version -Descending |
             Select-Object -First 1
     }
