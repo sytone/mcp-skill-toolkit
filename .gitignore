@@ -12,6 +12,7 @@ config/
 !tests/fixtures/servers.json
 dist/
 .test-tmp/
+test-results/
 *.log
 runtime-profile-*.json
 probe-*.ps1
