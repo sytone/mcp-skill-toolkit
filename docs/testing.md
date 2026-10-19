@@ -27,6 +27,8 @@ secrets. It does not start live MCP or Agency servers or deploy installed skills
 - Tool/parameter extraction and generated skill contents.
 - Generated wrapper execution against a local fake CLI, including JSON, UTF-8,
   input files/stdin, invalid input, named parameters, and failure propagation.
+- The generated wrapper tool-call log contract: records, opt-out, overrides,
+  absence of payload values, and resilience to unwritable log locations.
 - Offline builds, isolated deployment and custom-instruction preservation.
 - Source-only packaging, including planted fake credentials that must stay out.
 
