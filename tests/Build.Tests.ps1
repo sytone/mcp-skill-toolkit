@@ -327,6 +327,8 @@ Options:
             $runnerText | Should -Match '\[string\]\$CliPath'
             $runnerText | Should -Not -Match '(?i)(?:[a-z]:[\\/]Users[\\/]|/(?:home|Users)/)[^\\/\s]+'
             $runnerText | Should -Not -Match '\[string\]\$CliPath\s*=\s*''~[\\/]'
+            $runnerText | Should -Match '\$mcpToolkitLogDirectory = \(Join-Path \$HOME ''\.mcp-skill-toolkit[\\/]logs''\)'
+            $runnerText | Should -Match 'MCP_SKILL_TOOLKIT_LOG_DIR'
 
             $toolScripts = @(Get-ChildItem -Path (Join-Path $outputDir 'skills/calendar/scripts') -Filter '*.ps1' -File | Where-Object { $_.Name -ne 'Invoke-Tool.ps1' })
             if ($toolScripts.Count -gt 0) {
@@ -340,6 +342,46 @@ Options:
             @($summary).Count | Should -Be 2
             @($summary.server) | Should -Contain 'calendar'
             @($summary.server) | Should -Contain 'web-search'
+        }
+        finally {
+            & $script:RemoveTestRoot $tempRoot
+        }
+    }
+
+    It 'bakes the configured tool call log directory into the runner: <Case>' -ForEach @(
+        @{ Case = 'explicit path'; Disabled = $false }
+        @{ Case = 'disabled'; Disabled = $true }
+    ) {
+        $tempRoot = Join-Path $script:TempBase ("mcp-cli-pester-{0}" -f [Guid]::NewGuid().ToString('N'))
+        $outputDir = Join-Path $tempRoot 'dist'
+        $logDirectory = if ($Disabled) { '' } else { Join-Path $tempRoot "tool call log's" }
+
+        try {
+            New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+            $result = & $script:InvokeBuildTask Build @{
+                OutputDir = $outputDir
+                McpConfigPath = (Join-Path $tempRoot 'mcp_servers.json')
+                SelectedServerNames = 'calendar'
+                SkipDiscovery = $true
+                ToolCallLogDirectory = $logDirectory
+            }
+            $result.ExitCode | Should -Be 0
+
+            $runnerPath = Join-Path $outputDir 'skills/calendar/scripts/Invoke-Tool.ps1'
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+            $parseErrors.Count | Should -Be 0
+            $assignment = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$mcpToolkitLogDirectory'
+            }, $false)
+            $assignment | Should -Not -BeNullOrEmpty
+            $expected = if ($Disabled) { '' } else { [IO.Path]::GetFullPath($logDirectory) }
+            # The generator may express paths under the user's profile relative to $HOME.
+            $actual = & ([scriptblock]::Create($assignment.Right.Extent.Text))
+            $actual | Should -BeExactly $expected
+            Test-Path -LiteralPath (Join-Path $tempRoot "tool call log's") | Should -BeFalse
         }
         finally {
             & $script:RemoveTestRoot $tempRoot
