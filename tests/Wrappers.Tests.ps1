@@ -57,7 +57,7 @@ exit $LASTEXITCODE
                 [string]$CliPath = $script:WrappersFakeScript
             )
 
-            Write-McpToolScripts -ScriptsDir $script:WrappersScripts -ServerName $script:WrappersServer -ConfigReference $script:WrappersConfig -McpCli $CliPath -ToolMetadata $ToolMetadata
+            Write-McpToolScripts -ScriptsDir $script:WrappersScripts -ServerName $script:WrappersServer -ConfigReference $script:WrappersConfig -McpCli $CliPath -ToolMetadata $ToolMetadata -LogDirectory $script:WrappersBakedLogs
         }
 
         function Invoke-WrapperProcess {
@@ -65,7 +65,8 @@ exit $LASTEXITCODE
                 [string]$ScriptName = 'Invoke-Tool.ps1',
                 [hashtable]$Parameters = @{ Tool = 'Search-Notes' },
                 [string]$Stdin = '',
-                [int]$FakeExitCode = 0
+                [int]$FakeExitCode = 0,
+                [hashtable]$Environment = @{ MCP_SKILL_TOOLKIT_LOG_DIR = $script:WrappersLogs }
             )
 
             $invocationRoot = Join-Path $script:WrappersCase ([Guid]::NewGuid().ToString('N'))
@@ -96,6 +97,13 @@ exit $LASTEXITCODE
             $startInfo.Environment['MCP_WRAPPER_EXIT_CODE'] = [string]$FakeExitCode
             $startInfo.Environment['MCP_WRAPPER_INPUT_MODE'] = 'Pipeline'
             $startInfo.Environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
+            # Never inherit log settings: wrapper logs must stay in the test folder.
+            foreach ($name in @('MCP_SKILL_TOOLKIT_LOG', 'MCP_SKILL_TOOLKIT_LOG_DIR', 'MCP_SKILL_TOOLKIT_AGENT')) {
+                [void]$startInfo.Environment.Remove($name)
+            }
+            foreach ($entry in $Environment.GetEnumerator()) {
+                $startInfo.Environment[$entry.Key] = [string]$entry.Value
+            }
 
             $child = [Diagnostics.Process]::new()
             $child.StartInfo = $startInfo
@@ -137,6 +145,18 @@ exit $LASTEXITCODE
             }
         }
 
+        function Get-WrapperLogRecords {
+            param([string]$Directory = $script:WrappersLogs)
+
+            if (-not (Test-Path -LiteralPath $Directory)) {
+                return @()
+            }
+            $files = @(Get-ChildItem -LiteralPath $Directory -File)
+            $files.Count | Should -Be 1
+            $files[0].Name | Should -Match '^tool-calls-\d{4}-\d{2}-\d{2}\.jsonl$'
+            return @(Get-Content -LiteralPath $files[0].FullName -Encoding utf8 | ForEach-Object { ConvertFrom-Json -InputObject $_ -AsHashtable })
+        }
+
         function Assert-WrapperReceipt {
             param($Result, [string]$Tool = 'Search-Notes')
 
@@ -161,6 +181,8 @@ exit $LASTEXITCODE
         $script:WrappersScripts = Join-Path $script:WrappersCase 'generated scripts'
         $script:WrappersConfig = Join-Path $script:WrappersCase "config with ' quote.json"
         $script:WrappersFakeScript = Join-Path $script:WrappersCase "fake cli's script.ps1"
+        $script:WrappersLogs = Join-Path $script:WrappersCase "tool call logs 雪"
+        $script:WrappersBakedLogs = Join-Path $script:WrappersCase 'baked logs'
         [IO.File]::WriteAllText($script:WrappersConfig, '{"servers":{}}', $script:WrappersUtf8)
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/fake-mcp-cli.ps1') -Destination $script:WrappersFakeScript
         New-WrapperScripts
@@ -411,5 +433,117 @@ exit $LASTEXITCODE
         $actual = ConvertFrom-Json -InputObject $result.Receipt.Payload -AsHashtable
         $actual.Tool | Should -BeExactly 'payload tool'
         $actual.Text | Should -BeExactly 'safe generic dispatch'
+    }
+    It 'logs one JSON Lines record per successful call without payload values' {
+        $secret = "secret value O'Brien 雪"
+        $result = Invoke-WrapperProcess -ScriptName 'Search-Notes.ps1' -Parameters @{ Text = $secret; Count = 3 } -Environment @{
+            MCP_SKILL_TOOLKIT_LOG_DIR = $script:WrappersLogs
+            MCP_SKILL_TOOLKIT_AGENT = 'agent 雪'
+        }
+        Assert-WrapperReceipt $result
+        $records = @(Get-WrapperLogRecords)
+        $records.Count | Should -Be 1
+        $record = $records[0]
+        $record.schemaVersion | Should -Be 1
+        [Guid]::Parse($record.callId) | Should -Not -Be ([Guid]::Empty)
+        $record.server | Should -BeExactly $script:WrappersServer
+        $record.tool | Should -BeExactly 'Search-Notes'
+        $record.agent | Should -BeExactly 'agent 雪'
+        $record.processId | Should -BeGreaterThan 0
+        $record.inputSource | Should -BeExactly 'json'
+        @($record.argumentNames | Sort-Object) | Should -Be @('Count', 'Text')
+        $record.payloadBytes | Should -Be ([Text.Encoding]::UTF8.GetByteCount($result.Receipt.Payload))
+        $record.status | Should -BeExactly 'succeeded'
+        $record.exitCode | Should -Be 0
+        $record.error | Should -BeNullOrEmpty
+        $record.durationMs | Should -BeGreaterOrEqual 0
+        $logText = Get-Content -LiteralPath (Get-ChildItem -LiteralPath $script:WrappersLogs -File)[0].FullName -Raw -Encoding utf8
+        $logText | Should -Match '"timestamp":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z"'
+        $logText | Should -Not -Match ([regex]::Escape('secret value'))
+    }
+
+    It 'appends records for <Source> input and a nonzero CLI exit code' -ForEach @(
+        @{ Source = 'stdin' }
+        @{ Source = 'jsonPath' }
+    ) {
+        $parameters = @{ Tool = 'Search-Notes' }
+        $stdin = ''
+        if ($Source -eq 'stdin') {
+            $stdin = '[1,2]'
+        }
+        else {
+            $jsonPath = Join-Path $script:WrappersCase 'payload.json'
+            [IO.File]::WriteAllText($jsonPath, '[1,2]', $script:WrappersUtf8)
+            $parameters.JsonPath = $jsonPath
+        }
+
+        (Invoke-WrapperProcess -Parameters $parameters -Stdin $stdin).ExitCode | Should -Be 0
+        (Invoke-WrapperProcess -Parameters $parameters -Stdin $stdin -FakeExitCode 9).ExitCode | Should -Be 9
+        $records = @(Get-WrapperLogRecords)
+        $records.Count | Should -Be 2
+        $records[0].callId | Should -Not -Be $records[1].callId
+        $records | ForEach-Object { $_.inputSource | Should -BeExactly $Source }
+        @($records[0].argumentNames).Count | Should -Be 0
+        $records[1].status | Should -BeExactly 'failed'
+        $records[1].exitCode | Should -Be 9
+        $records[1].error | Should -BeExactly 'nonzero-exit'
+    }
+
+    It 'logs <Case> as a rejected call through <ScriptName>' -ForEach @(
+        @{ Case = 'conflicting input'; ScriptName = 'Search-Notes.ps1'; ErrorCode = 'conflicting-input' }
+        @{ Case = 'invalid JSON'; ScriptName = 'Invoke-Tool.ps1'; ErrorCode = 'invalid-json' }
+        @{ Case = 'a missing JSON file'; ScriptName = 'Invoke-Tool.ps1'; ErrorCode = 'unreadable-input' }
+    ) {
+        $parameters = switch ($Case) {
+            'conflicting input' { @{ Json = '{}'; JsonPath = (Join-Path $script:WrappersCase 'missing.json') } }
+            'invalid JSON' { @{ Tool = 'Search-Notes'; Json = '{"secret":' } }
+            'a missing JSON file' { @{ Tool = 'Search-Notes'; JsonPath = (Join-Path $script:WrappersCase 'missing.json') } }
+        }
+
+        $result = Invoke-WrapperProcess -ScriptName $ScriptName -Parameters $parameters
+        $result.ExitCode | Should -Not -Be 0
+        $result.Receipt | Should -BeNullOrEmpty
+        $records = @(Get-WrapperLogRecords)
+        $records.Count | Should -Be 1
+        $records[0].tool | Should -BeExactly 'Search-Notes'
+        $records[0].status | Should -BeExactly 'rejected'
+        $records[0].error | Should -BeExactly $ErrorCode
+        $records[0].exitCode | Should -BeNullOrEmpty
+        $records[0].payloadBytes | Should -BeNullOrEmpty
+    }
+
+    It 'uses the generated log directory when no override is set' {
+        $result = Invoke-WrapperProcess -Environment @{}
+        Assert-WrapperReceipt $result
+        @(Get-WrapperLogRecords -Directory $script:WrappersBakedLogs).Count | Should -Be 1
+        Test-Path -LiteralPath $script:WrappersLogs | Should -BeFalse
+    }
+
+    It 'does not log when MCP_SKILL_TOOLKIT_LOG is <Value>' -ForEach @(
+        @{ Value = 'off' }
+        @{ Value = '0' }
+        @{ Value = 'False' }
+    ) {
+        $result = Invoke-WrapperProcess -Environment @{ MCP_SKILL_TOOLKIT_LOG = $Value; MCP_SKILL_TOOLKIT_LOG_DIR = $script:WrappersLogs }
+        Assert-WrapperReceipt $result
+        Test-Path -LiteralPath $script:WrappersLogs | Should -BeFalse
+        Test-Path -LiteralPath $script:WrappersBakedLogs | Should -BeFalse
+    }
+
+    It 'does not log when generated without a log directory and no override is set' {
+        Write-McpToolScripts -ScriptsDir $script:WrappersScripts -ServerName $script:WrappersServer -ConfigReference $script:WrappersConfig -McpCli $script:WrappersFakeScript -ToolMetadata @()
+        $result = Invoke-WrapperProcess -Environment @{}
+        Assert-WrapperReceipt $result
+        @(Get-ChildItem -LiteralPath $script:WrappersCase -Directory | Where-Object Name -Match 'log').Count | Should -Be 0
+    }
+
+    It 'keeps the tool result and exit code when the log cannot be written' {
+        $blockingFile = Join-Path $script:WrappersCase 'not a directory'
+        [IO.File]::WriteAllText($blockingFile, 'file', $script:WrappersUtf8)
+        $result = Invoke-WrapperProcess -FakeExitCode 4 -Environment @{ MCP_SKILL_TOOLKIT_LOG_DIR = $blockingFile }
+        $result.ExitCode | Should -Be 4
+        $result.Stderr | Should -BeNullOrEmpty
+        $result.Receipt.Tool | Should -BeExactly 'Search-Notes'
+        (Get-Item -LiteralPath $blockingFile).PSIsContainer | Should -BeFalse
     }
 }

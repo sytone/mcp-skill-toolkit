@@ -13,6 +13,7 @@ Properties {
     $AgencyHelpText = $null
     $AgencyServerHelpJson = $null
     $PackagePath = Join-Path $PSScriptRoot 'mcp-cli-setup.zip'
+    $ToolCallLogDirectory = '~/.mcp-skill-toolkit/logs'
 }
 
 $ErrorActionPreference = 'Stop'
@@ -784,7 +785,8 @@ function Write-McpToolScripts {
         [string]$ServerName,
         [string]$ConfigReference,
         [string]$McpCli,
-        [object[]]$ToolMetadata
+        [object[]]$ToolMetadata,
+        [string]$LogDirectory = ''
     )
 
     if (Test-Path $ScriptsDir) {
@@ -795,6 +797,7 @@ function Write-McpToolScripts {
     $serverLiteral = ConvertTo-PowerShellSingleQuoted -Text $ServerName
     $configExpression = ConvertTo-PowerShellPathExpression -Path $ConfigReference
     $mcpCliExpression = ConvertTo-PowerShellPathExpression -Path $McpCli
+    $logDirectoryExpression = ConvertTo-PowerShellPathExpression -Path $LogDirectory
 
     $runnerTemplate = @'
 {{HEADER}}param(
@@ -807,6 +810,7 @@ function Write-McpToolScripts {
 )
 
 $ErrorActionPreference = 'Stop'
+$mcpToolkitLogDirectory = {{LOG_DIRECTORY}}
 
 function Set-McpCliUtf8Encoding {
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -856,53 +860,139 @@ function Repair-TextEncodingArtifacts {
     return $repaired
 }
 
+function Write-McpToolCallLog {
+    param([System.Collections.IDictionary]$Record)
+
+    # Logging must never change the tool result, exit code, or output streams.
+    try {
+        $logSetting = [string]$env:MCP_SKILL_TOOLKIT_LOG
+        if ($logSetting.Trim() -in @('0', 'off', 'false', 'no', 'disabled')) {
+            return
+        }
+        $logDirectory = if (-not [string]::IsNullOrWhiteSpace($env:MCP_SKILL_TOOLKIT_LOG_DIR)) { $env:MCP_SKILL_TOOLKIT_LOG_DIR } else { $mcpToolkitLogDirectory }
+        if ([string]::IsNullOrWhiteSpace($logDirectory)) {
+            return
+        }
+        $logDirectory = Resolve-UserPath -Path $logDirectory
+        New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+        $logPath = Join-Path $logDirectory ('tool-calls-{0}.jsonl' -f [DateTime]::UtcNow.ToString('yyyy-MM-dd'))
+        $line = (ConvertTo-Json -InputObject $Record -Depth 5 -Compress) + "`n"
+        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($line)
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+                $stream = [IO.FileStream]::new($logPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+                try {
+                    $stream.Write($bytes, 0, $bytes.Length)
+                }
+                finally {
+                    $stream.Dispose()
+                }
+                return
+            }
+            catch [IO.IOException] {
+                Start-Sleep -Milliseconds (25 * $attempt)
+            }
+        }
+    }
+    catch {
+    }
+}
+
 Set-McpCliUtf8Encoding
 
-if ($PSBoundParameters.ContainsKey('Json') -and $PSBoundParameters.ContainsKey('JsonPath')) {
-    throw 'Use only one of -Json or -JsonPath.'
+$mcpToolkitStopwatch = [Diagnostics.Stopwatch]::StartNew()
+$mcpToolkitCallLog = [ordered]@{
+    schemaVersion = 1
+    timestamp = [DateTime]::UtcNow.ToString('o')
+    callId = [Guid]::NewGuid().ToString()
+    server = {{SERVER_NAME}}
+    tool = $Tool
+    agent = if ([string]::IsNullOrWhiteSpace($env:MCP_SKILL_TOOLKIT_AGENT)) { $null } else { $env:MCP_SKILL_TOOLKIT_AGENT }
+    processId = $PID
+    inputSource = 'none'
+    argumentNames = @()
+    payloadBytes = $null
+    status = 'rejected'
+    exitCode = $null
+    error = 'invalid-input'
+    durationMs = $null
 }
-
-if ($PSBoundParameters.ContainsKey('Json')) {
-    $payload = $Json
-}
-elseif ($PSBoundParameters.ContainsKey('JsonPath')) {
-    $resolvedJsonPath = Resolve-UserPath -Path $JsonPath
-    $payload = Get-Content -Raw -Path $resolvedJsonPath
-}
-elseif ([Console]::IsInputRedirected) {
-    $payload = [Console]::In.ReadToEnd()
-}
-else {
-    $payload = '{}'
-}
-
-if ([string]::IsNullOrWhiteSpace($payload)) {
-    $payload = '{}'
-}
+$exitCode = 1
 
 try {
-    $parsedPayload = ConvertFrom-Json -InputObject $payload -Depth 100 -NoEnumerate
-    $payload = ConvertTo-Json -InputObject $parsedPayload -Depth 100 -Compress
-}
-catch {
-    throw "Invalid JSON payload for ${Tool}: $($_.Exception.Message)"
-}
+    if ($PSBoundParameters.ContainsKey('Json') -and $PSBoundParameters.ContainsKey('JsonPath')) {
+        $mcpToolkitCallLog.error = 'conflicting-input'
+        throw 'Use only one of -Json or -JsonPath.'
+    }
 
-$resolvedConfigPath = Resolve-UserPath -Path $ConfigPath
-$resolvedCliPath = Resolve-UserPath -Path $CliPath
+    if ($PSBoundParameters.ContainsKey('Json')) {
+        $mcpToolkitCallLog.inputSource = 'json'
+        $payload = $Json
+    }
+    elseif ($PSBoundParameters.ContainsKey('JsonPath')) {
+        $mcpToolkitCallLog.inputSource = 'jsonPath'
+        $mcpToolkitCallLog.error = 'unreadable-input'
+        $resolvedJsonPath = Resolve-UserPath -Path $JsonPath
+        $payload = Get-Content -Raw -Path $resolvedJsonPath
+    }
+    elseif ([Console]::IsInputRedirected) {
+        $mcpToolkitCallLog.inputSource = 'stdin'
+        $mcpToolkitCallLog.error = 'unreadable-input'
+        $payload = [Console]::In.ReadToEnd()
+    }
+    else {
+        $payload = '{}'
+    }
 
-$output = $payload | & $resolvedCliPath -c $resolvedConfigPath call {{SERVER_NAME}} $Tool 2>&1
-$exitCode = $LASTEXITCODE
-$text = ($output | Out-String).TrimEnd()
-if (-not [string]::IsNullOrEmpty($text)) {
-    Write-Output (Repair-TextEncodingArtifacts -Text $text)
+    if ([string]::IsNullOrWhiteSpace($payload)) {
+        $payload = '{}'
+    }
+
+    $mcpToolkitCallLog.error = 'invalid-json'
+    try {
+        $parsedPayload = ConvertFrom-Json -InputObject $payload -Depth 100 -NoEnumerate
+        $payload = ConvertTo-Json -InputObject $parsedPayload -Depth 100 -Compress
+    }
+    catch {
+        throw "Invalid JSON payload for ${Tool}: $($_.Exception.Message)"
+    }
+    # Record argument names and size only; payload values may contain sensitive data.
+    if ($parsedPayload -is [System.Management.Automation.PSCustomObject]) {
+        $mcpToolkitCallLog.argumentNames = @($parsedPayload.PSObject.Properties | ForEach-Object { $_.Name })
+    }
+    $mcpToolkitCallLog.payloadBytes = [System.Text.Encoding]::UTF8.GetByteCount($payload)
+
+    $resolvedConfigPath = Resolve-UserPath -Path $ConfigPath
+    $resolvedCliPath = Resolve-UserPath -Path $CliPath
+
+    $mcpToolkitCallLog.status = 'failed'
+    $mcpToolkitCallLog.error = 'cli-error'
+    $output = $payload | & $resolvedCliPath -c $resolvedConfigPath call {{SERVER_NAME}} $Tool 2>&1
+    $exitCode = $LASTEXITCODE
+    $mcpToolkitCallLog.exitCode = $exitCode
+    if ($exitCode -eq 0) {
+        $mcpToolkitCallLog.status = 'succeeded'
+        $mcpToolkitCallLog.error = $null
+    }
+    else {
+        $mcpToolkitCallLog.error = 'nonzero-exit'
+    }
+    $text = ($output | Out-String).TrimEnd()
+    if (-not [string]::IsNullOrEmpty($text)) {
+        Write-Output (Repair-TextEncodingArtifacts -Text $text)
+    }
+}
+finally {
+    $mcpToolkitStopwatch.Stop()
+    $mcpToolkitCallLog.durationMs = [long]$mcpToolkitStopwatch.ElapsedMilliseconds
+    Write-McpToolCallLog -Record $mcpToolkitCallLog
 }
 
 exit $exitCode
 '@
 
     $runnerHeader = Get-AutoGeneratedToolScriptHeader -ServerName $ServerName -ScriptName 'Invoke-Tool.ps1' -Description "Generic runner for invoking MCP tools for the '$ServerName' server."
-    $runner = $runnerTemplate.Replace('{{HEADER}}', $runnerHeader).Replace('{{SERVER_NAME}}', $serverLiteral).Replace('{{CONFIG_REFERENCE}}', $configExpression).Replace('{{MCP_CLI_PATH}}', $mcpCliExpression)
+    $runner = $runnerTemplate.Replace('{{HEADER}}', $runnerHeader).Replace('{{SERVER_NAME}}', $serverLiteral).Replace('{{CONFIG_REFERENCE}}', $configExpression).Replace('{{MCP_CLI_PATH}}', $mcpCliExpression).Replace('{{LOG_DIRECTORY}}', $logDirectoryExpression)
     $runner | Set-Content -Encoding UTF8 -Path (Join-Path $ScriptsDir 'Invoke-Tool.ps1')
 
     $reservedParameterNames = @(
@@ -948,15 +1038,14 @@ $mcpToolkitRunnerArguments = @{
     Tool = {{TOOL_NAME}}
 }
 
-if ($PSBoundParameters.ContainsKey('Json') -and $PSBoundParameters.ContainsKey('JsonPath')) {
-    throw 'Use only one of -Json or -JsonPath.'
-}
-
-if ($PSBoundParameters.ContainsKey('Json')) {
-    $mcpToolkitRunnerArguments.Json = $Json
-}
-elseif ($PSBoundParameters.ContainsKey('JsonPath')) {
-    $mcpToolkitRunnerArguments.JsonPath = $JsonPath
+# The generic runner validates, rejects, and logs conflicting JSON inputs.
+if ($PSBoundParameters.ContainsKey('Json') -or $PSBoundParameters.ContainsKey('JsonPath')) {
+    if ($PSBoundParameters.ContainsKey('Json')) {
+        $mcpToolkitRunnerArguments.Json = $Json
+    }
+    if ($PSBoundParameters.ContainsKey('JsonPath')) {
+        $mcpToolkitRunnerArguments.JsonPath = $JsonPath
+    }
 }
 else {
     if (@($PSBoundParameters.Keys).Length -gt 0) {
@@ -984,14 +1073,15 @@ function Write-McpCliSkillPackage {
         [string]$ConfigReference,
         [string]$McpCli,
         [string]$InfoText,
-        [object[]]$ToolMetadata
+        [object[]]$ToolMetadata,
+        [string]$LogDirectory = ''
     )
 
     $referencesDir = Join-Path $ServerDir 'references'
     New-Item -ItemType Directory -Force -Path $referencesDir | Out-Null
 
     $scriptsDir = Join-Path $ServerDir 'scripts'
-    Write-McpToolScripts -ScriptsDir $scriptsDir -ServerName $ServerName -ConfigReference $ConfigReference -McpCli $McpCli -ToolMetadata $ToolMetadata
+    Write-McpToolScripts -ScriptsDir $scriptsDir -ServerName $ServerName -ConfigReference $ConfigReference -McpCli $McpCli -ToolMetadata $ToolMetadata -LogDirectory $LogDirectory
 
     $description = Format-SkillDescription -Description ([string]$ServerConfig.description) -ServerName $ServerName
     $ToolNames = @($ToolMetadata | ForEach-Object { $_.Name })
@@ -1136,6 +1226,7 @@ Task Initialize -Description 'Load configuration and prepare output directories.
     $script:OutputRoot = Resolve-BuildPath -Path $OutputDir
     $script:ConfigReference = if ($McpConfigPath -eq '~' -or $McpConfigPath.StartsWith('~/') -or $McpConfigPath.StartsWith('~\')) { $McpConfigPath } else { Resolve-BuildPath -Path $McpConfigPath }
     $script:ConfigPath = Resolve-BuildPath -Path $McpConfigPath
+    $script:ToolCallLogReference = if ([string]::IsNullOrWhiteSpace($ToolCallLogDirectory)) { '' } elseif ($ToolCallLogDirectory -eq '~' -or $ToolCallLogDirectory.StartsWith('~/') -or $ToolCallLogDirectory.StartsWith('~\')) { $ToolCallLogDirectory } else { Resolve-BuildPath -Path $ToolCallLogDirectory }
     $script:SkillsRoot = Join-Path $script:OutputRoot 'skills'
     $script:DiscoveryRoot = Join-Path $script:OutputRoot 'discovery'
 
@@ -1269,7 +1360,7 @@ Task GenerateSkills -Depends Discover -Description 'Generate skill packages from
         Write-BuildLog "[$serverName] Building skill package"
 
         $serverDir = Join-Path $script:SkillsRoot $serverName
-        Write-McpCliSkillPackage -ServerDir $serverDir -ServerName $serverName -ServerConfig $entry.Value -ConfigPath $script:ConfigPath -ConfigReference $script:ConfigReference -McpCli $script:ScriptMcpCliPath -InfoText $discovery.InfoText -ToolMetadata $discovery.ToolMetadata
+        Write-McpCliSkillPackage -ServerDir $serverDir -ServerName $serverName -ServerConfig $entry.Value -ConfigPath $script:ConfigPath -ConfigReference $script:ConfigReference -McpCli $script:ScriptMcpCliPath -InfoText $discovery.InfoText -ToolMetadata $discovery.ToolMetadata -LogDirectory $script:ToolCallLogReference
         [void]$summary.Add([pscustomobject]@{
             server = $serverName
             discoveryExitCode = $discovery.ExitCode
