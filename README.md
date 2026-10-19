@@ -126,6 +126,40 @@ Do not edit generated scripts. Change `psakefile.ps1` and regenerate them.
 The current runner combines CLI output streams; callers should not assume its
 stdout is always a single JSON document, especially on errors.
 
+## Tool call logs
+
+Generated wrappers record every call, so you can see which tools agents ran,
+when, and with what outcome. `Invoke-Tool.ps1` appends one JSON object per line
+to `tool-calls-<yyyy-MM-dd>.jsonl` (UTC date) in the log directory. Per-tool
+wrappers delegate to it, so both entry points log the same way.
+
+| Field | Meaning |
+|-------|---------|
+| `schemaVersion` | Log contract version, currently `1` |
+| `timestamp` | UTC start time, ISO 8601 |
+| `callId` | Unique identifier for the call |
+| `server`, `tool` | MCP server and tool requested |
+| `agent` | Value of `MCP_SKILL_TOOLKIT_AGENT`, or `null` |
+| `processId` | Wrapper process ID |
+| `inputSource` | `json`, `jsonPath`, `stdin`, or `none` |
+| `argumentNames` | Top-level JSON object property names |
+| `payloadBytes` | UTF-8 size of the validated payload, or `null` |
+| `status` | `succeeded`, `failed` (CLI ran and failed), or `rejected` (input refused) |
+| `exitCode` | MCP CLI exit code, or `null` if it did not run |
+| `error` | `null`, `conflicting-input`, `unreadable-input`, `invalid-json`, `cli-error`, or `nonzero-exit` |
+| `durationMs` | Elapsed wrapper time in milliseconds |
+
+Argument values, payloads, and tool output are never logged, but tool and
+argument names are. Logging failures are ignored and never change a tool's
+output or exit code. The log is local observability, not an audit boundary.
+
+The build property `ToolCallLogDirectory` sets the default directory baked into
+the wrappers (`~/.mcp-skill-toolkit/logs`; an empty value disables it). At run
+time, `MCP_SKILL_TOOLKIT_LOG_DIR` overrides the directory and
+`MCP_SKILL_TOOLKIT_LOG=off` (or `0`, `false`, `no`, `disabled`) turns logging off.
+Have the agent host set `MCP_SKILL_TOOLKIT_AGENT` to identify the caller.
+Logs are not rotated or deleted automatically.
+
 ## Deploy to an agent
 
 Stage deployment in a separate directory first:
@@ -182,8 +216,8 @@ generated skills in a contribution.
 Use `Invoke-psake -Docs` to list task descriptions.
 
 Build properties include `SourceConfig`, `OutputDir`, `McpConfigPath`,
-`McpCliPath`, `SelectedServerNames`, `DiscoveryTimeoutSeconds`, and
-`SkipDiscovery`. Deployment accepts `SourceSkillsDir` and `TargetSkillsDir`.
+`McpCliPath`, `SelectedServerNames`, `DiscoveryTimeoutSeconds`,
+`SkipDiscovery`, and `ToolCallLogDirectory`. Deployment accepts `SourceSkillsDir` and `TargetSkillsDir`.
 
 For example, build one enabled server:
 
