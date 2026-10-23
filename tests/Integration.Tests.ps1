@@ -97,7 +97,7 @@ Describe 'Offline source integration and safety boundaries' {
         $summary[0].discoveryExitCode | Should -Be $FixtureExit
         $summary[0].toolCount | Should -Be 0
         Get-Content -Raw -LiteralPath (Join-Path $OutputDir 'discovery/everything.info.txt') | Should -Match ([regex]::Escape($ExpectedText))
-        @(Get-ChildItem -LiteralPath (Join-Path $OutputDir 'skills/everything/scripts') -File).Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath (Join-Path $OutputDir 'skills/everything/scripts') -File).Count | Should -Be 2
     }
 
     It 'does not resolve a CLI or create a summary when every selected server is disabled' {

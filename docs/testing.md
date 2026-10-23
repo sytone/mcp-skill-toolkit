@@ -29,6 +29,11 @@ secrets. It does not start live MCP or Agency servers or deploy installed skills
   input files/stdin, invalid input, named parameters, and failure propagation.
 - The generated wrapper tool-call log contract: records, opt-out, overrides,
   absence of payload values, and resilience to unwritable log locations.
+- Same-connection stdio discovery using a local JSON-RPC server and CLI double:
+  a negative control without the bridge, discovery ordering and pagination,
+  persistent/concurrent calls, server callbacks, inventory-change notifications,
+  script/Windows command-shim entry points, failure/timeout blocking, no tool
+  replay, child-process cleanup, and temporary-config cleanup.
 - Offline builds, isolated deployment and custom-instruction preservation.
 - Source-only packaging, including planted fake credentials that must stay out.
 
@@ -47,7 +52,8 @@ Do not lower the CI threshold instead of fixing missing coverage.
 Function tests load original AST scriptblocks so measurements retain the source
 file and line. Child-process integration tests and generated wrapper execution
 are separate behavioral evidence: their commands are not counted as source hits
-in the parent Pester process. Installer entry-point and external executable
+in the parent Pester process, including the generated stdio bridge.
+Installer entry-point and external executable
 integration paths are intentionally not exercised against real services.
 Passing offline tests does not prove authentication, upstream CLI formatting,
 or compatibility with every MCP server. Those need authorized manual checks.

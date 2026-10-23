@@ -108,9 +108,11 @@ if (-not $psake.build_success) {
         $publicFiles = @(
             '.gitignore', '.gitattributes', 'init.ps1', 'psakefile.ps1', 'README.md', 'AGENTS.md',
             'docs/creating-skills.md', 'docs/testing.md', 'servers.example.json', 'scripts/Invoke-Tests.ps1',
+            'scripts/Invoke-McpStdioBridge.ps1',
             'tests/Build.Tests.ps1', 'tests/Init.Tests.ps1', 'tests/Unit.Tests.ps1',
             'tests/Wrappers.Tests.ps1', 'tests/Integration.Tests.ps1', 'tests/Runner.Tests.ps1',
-            'tests/fixtures/servers.json', 'tests/fixtures/fake-mcp-cli.ps1'
+            'tests/Bridge.Tests.ps1', 'tests/fixtures/servers.json', 'tests/fixtures/fake-mcp-cli.ps1',
+            'tests/fixtures/stdio-mcp-server.ps1', 'tests/fixtures/stdio-mcp-cli.ps1'
         )
         $privateFiles = @(
             'servers.json', 'servers.local.json', 'config.json', 'config/private.json',
