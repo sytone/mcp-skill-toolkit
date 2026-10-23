@@ -130,6 +130,29 @@ is useful for payloads with quotes, newlines, or large values. The generic
 `scripts/Invoke-Tool.ps1` is the fallback for a known tool without a dedicated
 wrapper. Do not invent tool names or parameter names.
 
+### Servers that require tools/list before calls
+
+Generated stdio runners automatically use `scripts/Invoke-McpStdioBridge.ps1`.
+It completes discovery on the actual server connection before forwarding tool
+calls; agents should keep using their normal per-tool or generic wrapper.
+Do not initialize a session by running a separate `mcp-cli info` command, and do
+not invoke the bridge directly.
+
+Discovery follows pagination and fails closed on errors, invalid responses,
+repeated cursors, or timeout. Set `MCP_TIMEOUT` in seconds to bound discovery
+(default 1800). The bridge does not replay tool calls. HTTP entries keep their
+existing MCP CLI behavior and are not covered by the stdio workaround.
+
+The runtime runner creates and then removes a temporary MCP CLI configuration,
+leaving the original configuration and unselected server entries unchanged.
+This copy may contain the same sensitive configuration as the original; it is
+local runtime data, not a distributable skill artifact.
+
+To update previously generated skills, regenerate them with the updated toolkit,
+inspect the output, and stage deployment using an explicit `TargetSkillsDir`.
+Source changes alone do not update installed skills. Offline checks establish
+protocol behavior, not live server authentication or compatibility.
+
 ## Optional Agency integration
 
 The existing build also supports Agency-backed server commands. Agency is a
