@@ -84,14 +84,18 @@ function New-SetupArchive {
         'docs/testing.md',
         'servers.example.json',
         'scripts/Invoke-Tests.ps1',
+        'scripts/Invoke-McpStdioBridge.ps1',
         'tests/Build.Tests.ps1',
         'tests/Init.Tests.ps1',
         'tests/Unit.Tests.ps1',
         'tests/Wrappers.Tests.ps1',
         'tests/Integration.Tests.ps1',
         'tests/Runner.Tests.ps1',
+        'tests/Bridge.Tests.ps1',
         'tests/fixtures/servers.json',
-        'tests/fixtures/fake-mcp-cli.ps1'
+        'tests/fixtures/fake-mcp-cli.ps1',
+        'tests/fixtures/stdio-mcp-server.ps1',
+        'tests/fixtures/stdio-mcp-cli.ps1'
     )
     $archive = [IO.Compression.ZipFile]::Open($archivePath, [IO.Compression.ZipArchiveMode]::Create)
     try {
@@ -793,6 +797,7 @@ function Write-McpToolScripts {
         Remove-Item -Recurse -Force -Path $ScriptsDir
     }
     New-Item -ItemType Directory -Force -Path $ScriptsDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'scripts\Invoke-McpStdioBridge.ps1') -Destination $ScriptsDir
 
     $serverLiteral = ConvertTo-PowerShellSingleQuoted -Text $ServerName
     $configExpression = ConvertTo-PowerShellPathExpression -Path $ConfigReference
@@ -918,6 +923,7 @@ $mcpToolkitCallLog = [ordered]@{
     durationMs = $null
 }
 $exitCode = 1
+$runtimeConfigPath = $null
 
 try {
     if ($PSBoundParameters.ContainsKey('Json') -and $PSBoundParameters.ContainsKey('JsonPath')) {
@@ -965,6 +971,28 @@ try {
     $resolvedConfigPath = Resolve-UserPath -Path $ConfigPath
     $resolvedCliPath = Resolve-UserPath -Path $CliPath
 
+    $mcpToolkitCallLog.error = 'invalid-config'
+    $runtimeConfig = Get-Content -LiteralPath $resolvedConfigPath -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable -Depth 100
+    if (-not ($runtimeConfig.mcpServers -is [System.Collections.IDictionary]) -or
+        -not $runtimeConfig.mcpServers.Contains({{SERVER_NAME}})) {
+        throw ('MCP configuration does not contain server: ' + {{SERVER_NAME}})
+    }
+    $serverConfig = $runtimeConfig.mcpServers[{{SERVER_NAME}}]
+    if (-not $serverConfig.Contains('url') -and $serverConfig.Contains('command')) {
+        # Keep argv as separate strings so MCP CLI's env substitution and quoting
+        # still apply. Only the selected stdio server gets the session bridge.
+        $serverArguments = if ($serverConfig.Contains('args')) { @($serverConfig.args) } else { @() }
+        $serverConfig.args = @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-File',
+            (Join-Path $PSScriptRoot 'Invoke-McpStdioBridge.ps1'),
+            [string]$serverConfig.command
+        ) + $serverArguments
+        $serverConfig.command = (Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }))
+        $runtimeConfigPath = Join-Path ([IO.Path]::GetTempPath()) ('mcp-skill-toolkit-' + [Guid]::NewGuid().ToString('N') + '.json')
+        $runtimeConfig | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $runtimeConfigPath -Encoding utf8
+        $resolvedConfigPath = $runtimeConfigPath
+    }
+
     $mcpToolkitCallLog.status = 'failed'
     $mcpToolkitCallLog.error = 'cli-error'
     $output = $payload | & $resolvedCliPath -c $resolvedConfigPath call {{SERVER_NAME}} $Tool 2>&1
@@ -986,6 +1014,9 @@ finally {
     $mcpToolkitStopwatch.Stop()
     $mcpToolkitCallLog.durationMs = [long]$mcpToolkitStopwatch.ElapsedMilliseconds
     Write-McpToolCallLog -Record $mcpToolkitCallLog
+    if ($runtimeConfigPath -and (Test-Path -LiteralPath $runtimeConfigPath)) {
+        Remove-Item -LiteralPath $runtimeConfigPath -Force
+    }
 }
 
 exit $exitCode
@@ -1000,7 +1031,7 @@ exit $exitCode
         'args', 'input', 'this', 'null', 'true', 'false', 'HOME', 'PID', 'Host',
         'Error', 'ExecutionContext', 'PSVersionTable'
     )
-    $generatedToolNames = @('Invoke-Tool')
+    $generatedToolNames = @('Invoke-Tool', 'Invoke-McpStdioBridge')
     foreach ($tool in @($ToolMetadata)) {
         $toolName = [string]$tool.Name
         if ($toolName -notmatch '^[A-Za-z_][A-Za-z0-9_-]*$' -or $generatedToolNames -contains $toolName) {
@@ -1114,6 +1145,8 @@ STOP: use the generated PowerShell scripts only. Do not launch servers. Do not s
 Every generated skill package includes ``scripts/Invoke-Tool.ps1``. When tools are discovered at build time, it also includes one wrapper per tool, for example ``scripts/<tool>.ps1``.
 
 Prefer the per-tool wrapper first. These scripts handle UTF-8, JSON validation, config routing, and safe stdin piping.
+
+For stdio servers, the scripts automatically list tools on the active server connection before the first tool call. Do not run a separate discovery command to initialize a session, and do not invoke ``scripts/Invoke-McpStdioBridge.ps1`` directly. HTTP servers keep their existing transport behavior.
 
 Use one JSON blob:
 
