@@ -17,7 +17,7 @@ enabled server:
 ```text
 servers.json -> config -> tool discovery -> SKILL.md + scripts + references
 
-agent -> generated PowerShell wrapper -> mcp-cli -> MCP server
+agent -> generated PowerShell wrapper -> mcp-cli -> stdio bridge -> MCP server
 ```
 
 The toolkit generates the tool interface. Add task-specific guidance separately
@@ -92,6 +92,7 @@ dist/
   skills/<server>/
     SKILL.md
     scripts/Invoke-Tool.ps1
+    scripts/Invoke-McpStdioBridge.ps1 # internal stdio transport helper
     scripts/<tool>.ps1              # discovered tools only
     references/tool-info.md
 ```
@@ -126,6 +127,34 @@ Do not edit generated scripts. Change `psakefile.ps1` and regenerate them.
 The current runner combines CLI output streams; callers should not assume its
 stdout is always a single JSON document, especially on errors.
 
+### Session-local discovery
+
+For stdio servers, the runner automatically inserts a generated bridge between
+MCP CLI and the server. Before forwarding the first tool call on each connection,
+the bridge completes `tools/list`, including pagination, on that same connection.
+This supports proxies that reject calls until their session's tools are loaded.
+It also refreshes discovery after a `notifications/tools/list_changed` message.
+
+No MCP CLI changes or separate `info` command are needed. An earlier build-time
+discovery or a separate `info` process cannot guarantee runtime session state.
+The bridge does not retry tool calls. Failed, malformed, or timed-out discovery
+blocks queued calls instead of attempting them without an inventory.
+`MCP_TIMEOUT` bounds discovery in seconds (default 1800, matching MCP CLI).
+
+The runner reads the configured MCP CLI file without modifying it. For stdio
+calls it creates a temporary copy that wraps only the selected server, retaining
+its arguments, environment, working directory, and tool policy. It deletes that
+copy when the CLI returns, including failure paths. The bridge is resolved from
+the skill's current directory, so staged or deployed skills do not depend on a
+build-machine bridge path. PowerShell 7, native executables, and Windows
+`.cmd`/`.bat` server entry points are supported.
+
+HTTP entries are passed to MCP CLI unchanged; this workaround does not add
+session-local discovery to HTTP transports. Do not call the internal bridge
+directly or edit generated files. Regenerate affected skills and stage deployment
+to pick up generator changes; existing installed skills are not updated by
+changing the source alone.
+
 ## Tool call logs
 
 Generated wrappers record every call, so you can see which tools agents ran,
@@ -146,7 +175,7 @@ wrappers delegate to it, so both entry points log the same way.
 | `payloadBytes` | UTF-8 size of the validated payload, or `null` |
 | `status` | `succeeded`, `failed` (CLI ran and failed), or `rejected` (input refused) |
 | `exitCode` | MCP CLI exit code, or `null` if it did not run |
-| `error` | `null`, `conflicting-input`, `unreadable-input`, `invalid-json`, `cli-error`, or `nonzero-exit` |
+| `error` | `null`, `conflicting-input`, `unreadable-input`, `invalid-json`, `invalid-config`, `cli-error`, or `nonzero-exit` |
 | `durationMs` | Elapsed wrapper time in milliseconds |
 
 Argument values, payloads, and tool output are never logged, but tool and
@@ -251,6 +280,7 @@ docs/creating-skills.md    Skill creation and customization workflow
 docs/testing.md            Test commands, coverage scope, and limitations
 AGENTS.md                  Contributor and agent instructions
 scripts/Invoke-Tests.ps1    Shared local/CI test runner
+scripts/Invoke-McpStdioBridge.ps1  Source for the generated stdio transport helper
 .github/workflows/         GitHub Actions workflow
 tests/                     Offline Pester tests and fixtures
 ```

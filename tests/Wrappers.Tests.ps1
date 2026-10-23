@@ -183,7 +183,8 @@ exit $LASTEXITCODE
         $script:WrappersFakeScript = Join-Path $script:WrappersCase "fake cli's script.ps1"
         $script:WrappersLogs = Join-Path $script:WrappersCase "tool call logs 雪"
         $script:WrappersBakedLogs = Join-Path $script:WrappersCase 'baked logs'
-        [IO.File]::WriteAllText($script:WrappersConfig, '{"servers":{}}', $script:WrappersUtf8)
+        $config = @{ mcpServers = @{ $script:WrappersServer = @{ url = 'http://127.0.0.1:1/not-contacted' } } }
+        [IO.File]::WriteAllText($script:WrappersConfig, ($config | ConvertTo-Json -Depth 10), $script:WrappersUtf8)
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/fake-mcp-cli.ps1') -Destination $script:WrappersFakeScript
         New-WrapperScripts
     }
@@ -393,7 +394,7 @@ exit $LASTEXITCODE
         )
         New-WrapperScripts -ToolMetadata $metadata
         $files = @(Get-ChildItem -LiteralPath $script:WrappersScripts -File | Sort-Object Name | ForEach-Object Name)
-        $files.Count | Should -Be 2
+        $files.Count | Should -Be 3
         $files | Should -Contain 'Invoke-Tool.ps1'
         $files | Should -Contain '_valid-tool.ps1'
         Test-Path -LiteralPath (Join-Path $script:WrappersCase 'escape.ps1') | Should -BeFalse
