@@ -112,7 +112,19 @@ if (-not $psake.build_success) {
             'tests/Build.Tests.ps1', 'tests/Init.Tests.ps1', 'tests/Unit.Tests.ps1',
             'tests/Wrappers.Tests.ps1', 'tests/Integration.Tests.ps1', 'tests/Runner.Tests.ps1',
             'tests/Bridge.Tests.ps1', 'tests/fixtures/servers.json', 'tests/fixtures/fake-mcp-cli.ps1',
-            'tests/fixtures/stdio-mcp-server.ps1', 'tests/fixtures/stdio-mcp-cli.ps1'
+            'tests/fixtures/stdio-mcp-server.ps1', 'tests/fixtures/stdio-mcp-cli.ps1',
+            'src/.gitignore', 'src/Directory.Build.props', 'src/McpCli.slnx',
+            'src/Agents.md', 'src/README.md', 'src/THIRD-PARTY-NOTICES.txt',
+            'src/McpCli/McpCli.csproj', 'src/McpCli/Program.cs', 'src/McpCli/Cli.cs',
+            'src/McpCli/CliArguments.cs', 'src/McpCli/CliError.cs', 'src/McpCli/Configuration.cs',
+            'src/McpCli/Output.cs', 'src/McpCli/OutputSchema.cs', 'src/McpCli/Retry.cs',
+            'src/McpCli/McpConnection.cs', 'src/McpCli/RpcConnection.cs',
+            'src/McpCli/StdioTransport.cs', 'src/McpCli/HttpTransport.cs', 'src/McpCli/Daemon.cs',
+            'src/McpCli.Tests/McpCli.Tests.csproj', 'src/McpCli.Tests/TestWorkspace.cs',
+            'src/McpCli.Tests/CliTests.cs', 'src/McpCli.Tests/ConfigurationTests.cs',
+            'src/McpCli.Tests/TransportTests.cs', 'src/McpCli.Tests/DaemonTests.cs',
+            'src/McpCli.Tests/RetryTests.cs', 'src/McpCli.Tests/OutputSchemaTests.cs',
+            'src/McpCli.TestServer/McpCli.TestServer.csproj', 'src/McpCli.TestServer/Program.cs'
         )
         $privateFiles = @(
             'servers.json', 'servers.local.json', 'config.json', 'config/private.json',
@@ -120,7 +132,9 @@ if (-not $psake.build_success) {
             'credentials.json', 'tokens.json', '.git', 'backup.zip', 'backup.tar.gz', 'backup.7z',
             'tests/.env', 'tests/private.ps1', 'tests/.auth/helper.ps1',
             'tests/fixtures/servers.private.json', 'tests/fixtures/.tokens.json',
-            'dist/generated.ps1', '.test-tmp/private.txt'
+            'dist/generated.ps1', '.test-tmp/private.txt',
+            'src/McpCli/bin/Debug/net10.0/mcp-cli.dll', 'src/McpCli/obj/project.assets.json',
+            'src/McpCli.Tests/TestResults/private.trx', 'src/local-config.json', 'src/.env'
         )
 
         try {

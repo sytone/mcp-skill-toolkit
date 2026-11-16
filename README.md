@@ -37,6 +37,17 @@ The example uses the public
 not a production service. Its Windows command requires Node.js and `npx`.
 No server runtime is required for an offline build.
 
+## Local C# CLI port
+
+A standalone C# port of MCP CLI v0.3.0 is available under [src/](src/README.md),
+with colocated offline C# tests and contributor guidance. It can be built with
+.NET 10 or published as a self-contained executable, without Bun or runtime
+NuGet dependencies.
+
+This is not yet wired into the toolkit. The initializer, generated wrappers,
+and build/discovery commands below still use the existing MCP CLI setup.
+Switching those scripts to build and use the local port is a separate step.
+
 ## Quick start
 
 Clone the repository and create your machine-local configuration:
@@ -283,4 +294,5 @@ scripts/Invoke-Tests.ps1    Shared local/CI test runner
 scripts/Invoke-McpStdioBridge.ps1  Source for the generated stdio transport helper
 .github/workflows/         GitHub Actions workflow
 tests/                     Offline Pester tests and fixtures
+src/                       Standalone C# MCP CLI port, tests, and local test server
 ```
