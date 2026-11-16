@@ -18,7 +18,8 @@ public sealed class StdioTransport(string name, ServerConfig config, RuntimeSett
     public override Task StartAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var start = CreateStartInfo(config.Command, config.Args, config.Cwd ?? settings.WorkingDirectory, config.Map("env"));
+        var cwd = config.Cwd is { } configured ? Path.GetFullPath(configured, settings.WorkingDirectory) : settings.WorkingDirectory;
+        var start = CreateStartInfo(config.Command, config.Args, cwd, config.Map("env"));
         try
         {
             process = Process.Start(start) ?? throw new IOException($"Could not start {config.Command}");
@@ -97,7 +98,12 @@ public sealed class StdioTransport(string name, ServerConfig config, RuntimeSett
         {
             while (await reader.ReadLineAsync(lifetime.Token) is { } line)
             {
-                if (line.Length != 0) await DeliverAsync(line, lifetime.Token);
+                if (line.Length == 0) continue;
+                try { await DeliverAsync(line, lifetime.Token); }
+                catch (Exception error) when (error is System.Text.Json.JsonException or InvalidDataException or FormatException)
+                {
+                    settings.Debug($"Ignoring malformed stdio message: {error.Message}");
+                }
             }
             if (!lifetime.IsCancellationRequested)
             {
@@ -143,7 +149,7 @@ public sealed class StdioTransport(string name, ServerConfig config, RuntimeSett
         await writeLock.WaitAsync(cancellationToken);
         try
         {
-            await process.StandardInput.WriteLineAsync(message.ToJsonString().AsMemory(), cancellationToken);
+            await process.StandardInput.WriteLineAsync(McpJson.Serialize(message).AsMemory(), cancellationToken);
             await process.StandardInput.FlushAsync(cancellationToken);
         }
         finally { writeLock.Release(); }

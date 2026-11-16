@@ -49,7 +49,8 @@ public sealed class TestWorkspace : IAsyncDisposable
     {
         var config = new JsonObject();
         foreach (var (name, server) in servers) config[name] = server.Value.DeepClone();
-        await File.WriteAllTextAsync(ConfigPath, new JsonObject { ["mcpServers"] = config }.ToJsonString());
+        await File.WriteAllTextAsync(ConfigPath, new JsonObject { ["mcpServers"] = config }.ToJsonString(
+            new System.Text.Json.JsonSerializerOptions { MaxDepth = int.MaxValue }));
     }
 
     public Process StartCli(IEnumerable<string> arguments, bool withConfig = true)

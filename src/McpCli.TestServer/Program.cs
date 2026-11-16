@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.IO.Compression;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
@@ -12,9 +14,11 @@ if (Environment.GetEnvironmentVariable("FAKE_STDERR") is { } diagnostic) Console
 if (args.FirstOrDefault() != "http")
 {
     var session = new FakeSession();
+    var responses = new List<Task>();
+    if (Environment.GetEnvironmentVariable("FAKE_STDOUT_PREFIX") is { } prefix) Console.WriteLine(prefix);
     while (await Console.In.ReadLineAsync() is { } line)
     {
-        var request = JsonNode.Parse(line)!.AsObject();
+        var request = FixtureJson.Parse(line)!.AsObject();
         if (request["method"]?.ToString() == "tools/call" &&
             request["params"]?["name"]?.ToString() == "ping")
         {
@@ -23,15 +27,21 @@ if (args.FirstOrDefault() != "http")
             if (pong["id"]?.ToString() != "server-ping" || pong["result"] is not JsonObject)
                 throw new InvalidDataException("Client did not answer server ping");
         }
+        responses.Add(RespondAsync(request));
+    }
+    await Task.WhenAll(responses);
+    return;
+
+    async Task RespondAsync(JsonObject request)
+    {
         var response = await session.HandleAsync(request);
         if (response is not null)
         {
             if (Environment.GetEnvironmentVariable("FAKE_MALFORMED") == "1")
                 Console.WriteLine("{not-json}");
-            else Console.WriteLine(response.ToJsonString());
+            else Console.WriteLine(FixtureJson.Serialize(response));
         }
     }
-    return;
 }
 
 var builder = WebApplication.CreateSlimBuilder();
@@ -41,9 +51,24 @@ var app = builder.Build();
 var sessions = new ConcurrentDictionary<string, FakeSession>();
 var resume = new ConcurrentDictionary<string, JsonObject>();
 var httpFailures = 0;
+app.MapMethods("/redirect", ["GET", "POST"], context =>
+{
+    context.Response.StatusCode = int.TryParse(Environment.GetEnvironmentVariable("FAKE_REDIRECT_STATUS"), out var status) ? status : 307;
+    context.Response.Headers.Location = Environment.GetEnvironmentVariable("FAKE_REDIRECT_TARGET") ?? "/mcp";
+    return Task.CompletedTask;
+});
 app.MapMethods("/mcp", ["GET", "POST", "DELETE"], async context =>
 {
     var mode = Environment.GetEnvironmentVariable("FAKE_HTTP_MODE") ?? "json";
+    if (Environment.GetEnvironmentVariable("FAKE_HTTP_HEADERS_LOG") is { } headerLog)
+        await FakeSession.LogAsync(headerLog, new JsonObject
+        {
+            ["method"] = context.Request.Method,
+            ["authorization"] = context.Request.Headers.Authorization.ToString(),
+            ["contentType"] = context.Request.ContentType,
+            ["session"] = context.Request.Headers["Mcp-Session-Id"].ToString(),
+            ["protocol"] = context.Request.Headers["MCP-Protocol-Version"].ToString()
+        });
     if (Environment.GetEnvironmentVariable("FAKE_HTTP_AUTH") is { } auth &&
         context.Request.Headers.Authorization.ToString() != auth)
     {
@@ -76,18 +101,20 @@ app.MapMethods("/mcp", ["GET", "POST", "DELETE"], async context =>
         context.Response.StatusCode = 406;
         return;
     }
-    var request = (await JsonNode.ParseAsync(context.Request.Body))!.AsObject();
+    var request = (await JsonNode.ParseAsync(context.Request.Body,
+        documentOptions: new JsonDocumentOptions { MaxDepth = int.MaxValue }))!.AsObject();
     var sessionId = context.Request.Headers["Mcp-Session-Id"].ToString();
     FakeSession session;
     if (request["method"]?.ToString() == "initialize")
     {
         sessionId = Guid.NewGuid().ToString("N");
         session = new FakeSession();
-        sessions[sessionId] = session;
+        sessions[Environment.GetEnvironmentVariable("FAKE_EXPECT_SESSION_ID") ?? sessionId] = session;
         context.Response.Headers["Mcp-Session-Id"] = sessionId;
     }
     else if (!sessions.TryGetValue(sessionId, out session!) ||
-        context.Request.Headers["MCP-Protocol-Version"].ToString() != session.Version)
+        context.Request.Headers["MCP-Protocol-Version"].ToString() !=
+            (Environment.GetEnvironmentVariable("FAKE_EXPECT_PROTOCOL_VERSION") ?? session.Version))
     {
         context.Response.StatusCode = 400;
         await context.Response.WriteAsync("Missing session or protocol header");
@@ -95,6 +122,22 @@ app.MapMethods("/mcp", ["GET", "POST", "DELETE"], async context =>
     }
     var response = await session.HandleAsync(request);
     if (response is null) { context.Response.StatusCode = mode == "batch" ? 200 : 202; return; }
+    if (Environment.GetEnvironmentVariable("FAKE_HTTP_COMPRESSION") is { } compression)
+    {
+        context.Response.ContentType = mode == "sse" ? "text/event-stream" : "application/json";
+        context.Response.Headers.ContentEncoding = compression;
+        var json = FixtureJson.Serialize(response);
+        var data = Encoding.UTF8.GetBytes(mode == "sse" ? $"data: {json}\n\n" : json);
+        await using Stream compressor = compression switch
+        {
+            "gzip" => new GZipStream(context.Response.Body, CompressionLevel.Fastest, leaveOpen: true),
+            "deflate" => new ZLibStream(context.Response.Body, CompressionLevel.Fastest, leaveOpen: true),
+            "br" => new BrotliStream(context.Response.Body, CompressionLevel.Fastest, leaveOpen: true),
+            _ => throw new InvalidDataException($"Unknown fixture compression: {compression}")
+        };
+        await compressor.WriteAsync(data);
+        return;
+    }
     if (mode == "malformed") { context.Response.ContentType = "application/json"; await context.Response.WriteAsync("{bad"); return; }
     if (mode == "wrong-content-type") { await context.Response.WriteAsync("invalid"); return; }
     if (mode == "resume" && request["method"]?.ToString() == "tools/call")
@@ -110,7 +153,7 @@ app.MapMethods("/mcp", ["GET", "POST", "DELETE"], async context =>
         context.Response.ContentType = "text/event-stream";
         await context.Response.WriteAsync(": keep-alive\r\n\r\n");
         await context.Response.WriteAsync("event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\r\n\r\n");
-        var text = "event: message\r\ndata: " + response.ToJsonString() + "\r\n\r\n";
+        var text = "event: message\r\ndata: " + FixtureJson.Serialize(response) + "\r\n\r\n";
         var bytes = Encoding.UTF8.GetBytes(text);
         for (var i = 0; i < bytes.Length; i += 17)
         {
@@ -120,7 +163,7 @@ app.MapMethods("/mcp", ["GET", "POST", "DELETE"], async context =>
         return;
     }
     context.Response.ContentType = "application/json";
-    await context.Response.WriteAsync(mode == "batch" ? new JsonArray(response).ToJsonString() : response.ToJsonString());
+    await context.Response.WriteAsync(FixtureJson.Serialize(mode == "batch" ? new JsonArray(response) : response));
 });
 await app.StartAsync();
 Console.WriteLine(app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single() + "/mcp");
@@ -138,16 +181,26 @@ internal sealed class FakeSession
     private int lists;
     public string Version { get; } = Environment.GetEnvironmentVariable("FAKE_PROTOCOL") ?? "2025-11-25";
     private static readonly SemaphoreSlim LogLock = new(1);
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> pending = new();
+
+    public static async Task LogAsync(string path, JsonObject entry)
+    {
+        await LogLock.WaitAsync();
+        try { await File.AppendAllTextAsync(path, FixtureJson.Serialize(entry) + "\n"); }
+        finally { LogLock.Release(); }
+    }
 
     public async Task<JsonObject?> HandleAsync(JsonObject request)
     {
         if (Environment.GetEnvironmentVariable("FAKE_REQUEST_LOG") is { } path)
-        {
-            await LogLock.WaitAsync();
-            try { await File.AppendAllTextAsync(path, request.ToJsonString() + "\n"); }
-            finally { LogLock.Release(); }
-        }
+            await LogAsync(path, request);
         var method = request["method"]?.ToString();
+        if (method == "notifications/cancelled")
+        {
+            if (request["params"]?["requestId"] is { } id && pending.TryGetValue(id.ToJsonString(), out var cancellation))
+                await cancellation.CancelAsync();
+            return null;
+        }
         if (method == "notifications/initialized") { initialized = true; return null; }
         if (request["id"] is null) return null;
         JsonNode result;
@@ -176,8 +229,11 @@ internal sealed class FakeSession
                 var tool = new JsonObject { ["name"] = name, ["description"] = "Description for " + name, ["inputSchema"] = schema.DeepClone() };
                 if (name == "echo")
                 {
+                    if (Environment.GetEnvironmentVariable("FAKE_TOOL_OVERRIDES") is { } overrides)
+                        foreach (var (key, value) in FixtureJson.Parse(overrides)!.AsObject())
+                            tool[key] = value?.DeepClone();
                     if (Environment.GetEnvironmentVariable("FAKE_OUTPUT_SCHEMA") is { } outputSchema)
-                        tool["outputSchema"] = JsonNode.Parse(outputSchema);
+                        tool["outputSchema"] = FixtureJson.Parse(outputSchema);
                     if (Environment.GetEnvironmentVariable("FAKE_REQUIRED_TASK") == "1")
                         tool["execution"] = new JsonObject { ["taskSupport"] = "required" };
                 }
@@ -187,11 +243,38 @@ internal sealed class FakeSession
         }
         else if (method == "tools/call")
         {
-            calls++;
+            Interlocked.Increment(ref calls);
             var name = request["params"]?["name"]?.ToString();
             var arguments = request["params"]?["arguments"];
+            if (Environment.GetEnvironmentVariable("FAKE_TOOL_RESULT") is { } toolResult)
+                return Result(request, FixtureJson.Parse(toolResult)!);
             switch (name)
             {
+                case "error_code_text":
+                    if (calls == 1) return Error(request, "EPIPE while validating input");
+                    result = Text("unexpected retry");
+                    break;
+                case "cancellable":
+                    var requestId = request["id"]!.ToJsonString();
+                    using (var cancellation = new CancellationTokenSource())
+                    {
+                        pending[requestId] = cancellation;
+                        try
+                        {
+                            await Task.Delay(5000, cancellation.Token);
+                            if (Environment.GetEnvironmentVariable("FAKE_REQUEST_LOG") is { } completedLog)
+                                await LogAsync(completedLog, new JsonObject { ["method"] = "fixture/completed" });
+                            result = Text("completed");
+                        }
+                        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+                        {
+                            if (Environment.GetEnvironmentVariable("FAKE_REQUEST_LOG") is { } cancelledLog)
+                                await LogAsync(cancelledLog, new JsonObject { ["method"] = "fixture/cancelled" });
+                            return Error(request, "cancelled");
+                        }
+                        finally { pending.TryRemove(requestId, out _); }
+                    }
+                    break;
                 case "fail": return Error(request, "validation failed: text required");
                 case "missing": return Error(request, "unknown tool");
                 case "slow":
@@ -215,11 +298,12 @@ internal sealed class FakeSession
                 case "structured_only": result = new JsonObject { ["structuredContent"] = new JsonObject { ["value"] = 42 } }; break;
                 default:
                     if (arguments is not JsonObject) return Error(request, "invalid_type: arguments must be an object");
-                    result = Text(arguments["text"]?.GetValue<string>() ?? arguments.ToJsonString());
+                    result = Text(arguments["text"]?.GetValue<string>() ?? FixtureJson.Serialize(arguments));
                     if (arguments["structured"] is { } structured) result["structuredContent"] = structured.DeepClone();
                     if (arguments["isError"] is { } isError) result["isError"] = isError.DeepClone();
                     break;
             }
+
         }
         else return Error(request, "Method not found");
         return Result(request, result);
@@ -238,4 +322,12 @@ internal sealed class FakeSession
         ["jsonrpc"] = "2.0", ["id"] = request["id"]!.DeepClone(),
         ["error"] = new JsonObject { ["code"] = -32602, ["message"] = message }
     };
+}
+
+internal static class FixtureJson
+{
+    private static readonly JsonSerializerOptions Options = new() { MaxDepth = int.MaxValue };
+    public static JsonNode? Parse(string json) => JsonNode.Parse(json,
+        documentOptions: new JsonDocumentOptions { MaxDepth = int.MaxValue });
+    public static string Serialize(JsonNode node) => node.ToJsonString(Options);
 }

@@ -1,4 +1,3 @@
-using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -8,11 +7,8 @@ public sealed record ToolInfo(string Name, string? Description, JsonObject Input
 {
     public static ToolInfo FromJson(JsonNode? node)
     {
-        if (node is not JsonObject tool || tool["name"] is not JsonValue name ||
-            !name.TryGetValue<string>(out var text) || tool["inputSchema"] is not JsonObject schema ||
-            schema["type"]?.ToString() != "object")
-            throw new InvalidDataException("Invalid tools/list response: expected tool name and inputSchema");
-        return new(text, tool["description"]?.GetValue<string>(), schema);
+        var tool = McpSchema.Tool(node);
+        return new(tool["name"]!.GetValue<string>(), tool["description"]?.GetValue<string>(), tool["inputSchema"]!.AsObject());
     }
 }
 
@@ -20,11 +16,7 @@ public sealed record ServerTools(string Name, ToolInfo[] Tools, string? Instruct
 
 public sealed class Output(bool colorize)
 {
-    public static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        WriteIndented = true,
-        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
-    };
+    public static readonly JsonSerializerOptions JsonOptions = McpJson.IndentedOptions;
     public static string Json(JsonNode? value) => value?.ToJsonString(JsonOptions) ?? "null";
     private string Color(string value, string code) => colorize ? $"\x1b[{code}m{value}\x1b[0m" : value;
     private string Bold(string value) => Color(value, "1");
@@ -91,6 +83,7 @@ public sealed class Output(bool colorize)
                     var typeNode = schema is JsonObject property ? property["type"] : null;
                     var type = typeNode is JsonArray types ? string.Join(',', types.Select(n => n?.ToString())) :
                         typeNode?.ToString() ?? "any";
+                    if (typeNode is not JsonArray && type.Length == 0) type = "any";
                     var description = descriptions && schema is JsonObject prop && prop["description"] is { } desc ?
                         $" - {desc.GetValue<string>()}" : "";
                     lines.Add($"      \u2022 {parameter} ({type}, {required}){description}");

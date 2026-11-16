@@ -126,7 +126,7 @@ public static class Cli
             }
         }
         if (string.IsNullOrEmpty(json)) return new JsonObject();
-        try { return JsonNode.Parse(json); }
+        try { return McpJson.Parse(json); }
         catch (JsonException cause)
         {
             throw new CliError(1, "INVALID_JSON_ARGUMENTS", "Invalid JSON in tool arguments", $"Parse error: {cause.Message}",
@@ -168,7 +168,7 @@ public static class Cli
         {
             try
             {
-                var root = JsonNode.Parse(await File.ReadAllTextAsync(
+                var root = McpJson.Parse(await File.ReadAllTextAsync(
                     Path.GetFullPath(candidate!, settings.WorkingDirectory), token));
                 if (root is JsonObject obj && obj["mcpServers"] is JsonObject servers) return servers.Select(p => p.Key).ToArray();
             }

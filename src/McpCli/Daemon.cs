@@ -61,7 +61,7 @@ public static class Daemon
         try
         {
             // Configuration (including credentials) is never placed in the process command line.
-            await process.StandardInput.WriteLineAsync(config.Value.ToJsonString().AsMemory(), startup.Token);
+            await process.StandardInput.WriteLineAsync(McpJson.Serialize(config.Value).AsMemory(), startup.Token);
             process.StandardInput.Close();
             while (await process.StandardOutput.ReadLineAsync(startup.Token).AsTask().WaitAsync(startup.Token) is { } line)
             {
@@ -121,10 +121,10 @@ public static class Daemon
             using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
             var id = Guid.NewGuid().ToString("N");
             var request = new JsonObject { ["id"] = id, ["type"] = type, ["toolName"] = tool, ["args"] = args?.DeepClone() };
-            await writer.WriteLineAsync(request.ToJsonString().AsMemory(), timeout.Token);
+            await writer.WriteLineAsync(McpJson.Serialize(request).AsMemory(), timeout.Token);
             while (await reader.ReadLineAsync(timeout.Token) is { } line)
             {
-                if (JsonNode.Parse(line) is not JsonObject response) throw new IOException("Invalid response from daemon");
+                if (McpJson.Parse(line) is not JsonObject response) throw new IOException("Invalid response from daemon");
                 if (response["diagnostic"] is { } diagnostic)
                 {
                     settings.Diagnostics(diagnostic.GetValue<string>());
@@ -212,7 +212,7 @@ public static class Daemon
                     JsonObject response;
                     try
                     {
-                        request = JsonNode.Parse(line ?? "") as JsonObject ??
+                        request = McpJson.Parse(line ?? "") as JsonObject ??
                             throw new InvalidDataException("Invalid JSON request");
                         var type = request["type"]?.GetValue<string>();
                         JsonNode? data = type switch
@@ -270,7 +270,7 @@ public static class Daemon
         try
         {
             await foreach (var frame in frames.ReadAllAsync(token))
-                await writer.WriteLineAsync(frame.ToJsonString().AsMemory(), token);
+                await writer.WriteLineAsync(McpJson.Serialize(frame).AsMemory(), token);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (IOException) { /* The requesting CLI has closed its pipe. */ }

@@ -16,7 +16,7 @@ public abstract class RpcTransport : IAsyncDisposable
 
     protected async Task DeliverAsync(string json, CancellationToken cancellationToken)
     {
-        var message = JsonNode.Parse(json);
+        var message = McpJson.Parse(json);
         if (message is not JsonObject obj || obj["jsonrpc"]?.ToString() != "2.0")
             throw new InvalidDataException("Invalid JSON-RPC message from server");
         await ReceiveAsync(obj, cancellationToken);
@@ -26,6 +26,7 @@ public abstract class RpcTransport : IAsyncDisposable
 public sealed class RpcConnection : IAsyncDisposable
 {
     private readonly RpcTransport transport;
+    private readonly RuntimeSettings settings;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonNode?>> pending = new();
     private long nextId;
     private Exception? failure;
@@ -35,9 +36,10 @@ public sealed class RpcConnection : IAsyncDisposable
     public static readonly string[] SupportedVersions =
         ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
 
-    public RpcConnection(RpcTransport transport)
+    public RpcConnection(RpcTransport transport, RuntimeSettings settings)
     {
         this.transport = transport;
+        this.settings = settings;
         transport.ReceiveAsync = ReceiveAsync;
         transport.Failed = Fail;
     }
@@ -80,6 +82,27 @@ public sealed class RpcConnection : IAsyncDisposable
                 ["jsonrpc"] = "2.0", ["id"] = id, ["method"] = method, ["params"] = parameters.DeepClone()
             }, cancellationToken);
             return await completion.Task.WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (!completion.Task.IsCompleted && pending.TryRemove(key, out _))
+            {
+                // The request's token has expired; cancellation needs its own bounded send.
+                using var cancellation = new CancellationTokenSource(1000);
+                try
+                {
+                    await transport.SendAsync(new JsonObject
+                    {
+                        ["jsonrpc"] = "2.0", ["method"] = "notifications/cancelled",
+                        ["params"] = new JsonObject { ["requestId"] = id, ["reason"] = "Request cancelled or timed out" }
+                    }, cancellation.Token);
+                }
+                catch (Exception error) when (error is IOException or HttpRequestException or OperationCanceledException)
+                {
+                    settings.Debug($"Failed to send cancellation: {error.Message}");
+                }
+            }
+            throw;
         }
         finally
         {

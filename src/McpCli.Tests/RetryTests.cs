@@ -10,7 +10,8 @@ public sealed class RetryTests
     [DataRow("network error occurred", true)]
     [DataRow("connection reset by peer", true)]
     [DataRow("request timeout", true)]
-    [DataRow("ECONNREFUSED", true)]
+    [DataRow("ECONNREFUSED", false)]
+    [DataRow("EPIPE while validating input", false)]
     [DataRow("Error at line 502 in file", false)]
     [DataRow("Port 5029 is in use", false)]
     [DataRow("social network tool failed", false)]
@@ -48,5 +49,16 @@ public sealed class RetryTests
             return 1;
         }, "test", settings, CancellationToken.None));
         Assert.IsTrue(cancelled);
+    }
+
+    [TestMethod]
+    [DataRow(System.Net.Sockets.SocketError.ConnectionRefused)]
+    [DataRow(System.Net.Sockets.SocketError.ConnectionReset)]
+    [DataRow(System.Net.Sockets.SocketError.TimedOut)]
+    public void ParityActualSocketErrorsRemainRetryable(System.Net.Sockets.SocketError code)
+    {
+        var error = new System.Net.Sockets.SocketException((int)code);
+        Assert.IsTrue(Retry.IsTransient(error));
+        Assert.IsTrue(Retry.IsTransient(new IOException("Transport failed", error)));
     }
 }

@@ -70,6 +70,17 @@ is the tested host, not a claim of verified Linux/macOS compatibility.
 | Cached connections | Lazy per-server worker, config fingerprinting, readiness check, direct fallback, idle shutdown |
 | Cached tool metadata | Structured output-schema checks and required-task rejection after `tools/list` |
 
+Relative stdio working directories are resolved against the invoking CLI's
+working directory. HTTP supports compressed JSON/SSE responses and preserves
+authorization on same-origin redirects, while removing it on cross-origin
+redirects. Explicit session/protocol headers override negotiated defaults,
+matching the upstream SDK. POST content type is always `application/json`.
+
+MCP responses are validated and normalized before display, including nested
+content, annotations, resources, and tool metadata. Unknown content fields are
+removed; `_meta` and root result extensions are retained. JSON parsing and
+serialization do not impose the .NET default 64-level depth limit.
+
 Some upstream README examples are stale. In the pinned source:
 
 - `call` does **not** normally print the MCP envelope; text results are raw text.
@@ -84,6 +95,10 @@ Some upstream README examples are stale. In the pinned source:
 - List/grep can succeed with partial server failures, reporting those failures
   in the upstream output locations.
 - The HTTP config `timeout` field is retained but not used by upstream.
+- The client does not enforce strict tool-capability advertisement before
+  attempting discovery or calls, matching the upstream SDK's default.
+- Malformed stdio lines are diagnosed in debug mode and skipped without losing
+  subsequent valid responses. Malformed tool results still fail validation.
 
 ### Environment variables
 
@@ -103,7 +118,10 @@ Some upstream README examples are stale. In the pinned source:
 As upstream does, retries include tool calls. A lost response can therefore
 cause a non-idempotent operation to be repeated. Set `MCP_MAX_RETRIES=0` when
 that is unacceptable. Resuming an interrupted SSE response does not replay
-the tool POST.
+the tool POST. Network-code strings such as `EPIPE` inside an MCP error do not
+qualify as socket error codes. When a pending request times out or is cancelled,
+the client sends `notifications/cancelled` with that request's ID using a
+separate, bounded send. Cancellation is cooperative: the server must honor it.
 
 ### Deliberate platform and reliability differences
 
@@ -123,10 +141,16 @@ the tool POST.
   failing later in a JavaScript SDK. Recovery hints refer to supported flags.
 - Structured-output checks implement the upstream default draft-07 vocabulary,
   local references/IDs, previously registered schema IDs, and formats without
-  fetching schemas. This is not an
-  exported replacement for the AJV library: host regex, numeric, format, and
-  diagnostic wording can differ. Unregistered external references fail instead
-  of accessing the network, as with upstream's synchronous schema provider.
+  fetching schemas. The reviewed nullable, local-reference, format and
+  floating-point cases match AJV 8.17.1 with ajv-formats 3.0.1, including AJV's
+  exact floating-point `multipleOf` behavior (for example, `0.3 / 0.1`).
+  Schema keywords are checked during discovery, not delayed until a call.
+  Schema regex character atoms operate on Unicode code points, including
+  general-category property escapes such as `\p{Letter}`. This remains a local
+  implementation, not a complete replacement for JavaScript RegExp/AJV:
+  Unicode data versions, properties outside general categories, other regex
+  extensions, and diagnostics are not guaranteed identical. Unregistered
+  external schema references fail instead of accessing the network.
 - Windows batch argument escaping follows the upstream SDK's cross-spawn
   convention. Multiline process arguments must use a native executable.
   Multiline **tool JSON** uses stdin and has no such restriction.
@@ -165,6 +189,28 @@ and exit codes, Unicode/stdin, filtering, protocol headers, HTTP resumption,
 retries/timeouts, schema metadata, batch commands, worker concurrency/reuse,
 large frames, long calls, and cleanup. Nothing contacts a live MCP server or
 reads the user's server configuration.
+
+### Retained parity regressions
+
+The `Parity*` tests retain the concrete failures found by differential execution
+against the pinned upstream source and SDK. They run with MSTest and local C#
+fixtures; Bun and the original JavaScript packages are not test dependencies.
+
+| Regression area | Permanent tests |
+| --- | --- |
+| Non-transient error text must not replay calls; actual socket errors remain retryable | `RetryTests`, `TransportTests` |
+| Timeout cancellation observed by stdio, HTTP, and cached servers | `TransportTests` |
+| Relative working directories and malformed-line recovery | `TransportTests` |
+| Configured HTTP headers, compressed responses, same/cross-origin redirects, redirect limits | `TransportTests` |
+| Invalid tool metadata/content and preservation/removal of appropriate fields | `TransportTests` |
+| Deep configuration, arguments, IPC, and structured result output | `TransportTests` |
+| Optional capability enforcement and parameter-type formatting | `TransportTests` |
+| Unicode patterns, nullable unions, formats, `multipleOf`, references, and invalid schema compilation | `OutputSchemaTests` |
+| Successful discovery followed by structured calls on cached connections | `OutputSchemaTests` |
+
+These regressions establish the reviewed cases, not certification of every
+possible JSON Schema or live MCP server. The deliberate worker/platform
+differences above remain unchanged.
 
 To run these same tests against a published executable:
 

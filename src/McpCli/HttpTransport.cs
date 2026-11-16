@@ -7,7 +7,12 @@ namespace McpCli;
 
 public sealed class HttpTransport(ServerConfig config, RuntimeSettings settings) : RpcTransport
 {
-    private readonly HttpClient client = new() { Timeout = Timeout.InfiniteTimeSpan };
+    private readonly HttpClient client = new(new HttpClientHandler
+    {
+        AutomaticDecompression = DecompressionMethods.All,
+        AllowAutoRedirect = false,
+        UseCookies = false
+    }) { Timeout = Timeout.InfiniteTimeSpan };
     private readonly CancellationTokenSource lifetime = new();
     private string? sessionId;
     private Task? eventTask;
@@ -25,33 +30,34 @@ public sealed class HttpTransport(ServerConfig config, RuntimeSettings settings)
         return Task.CompletedTask;
     }
 
-    private HttpRequestMessage CreateRequest(HttpMethod method)
+    private HttpRequestMessage CreateRequest(HttpMethod method, JsonObject? message = null)
     {
         var request = new HttpRequestMessage(method, config.Url);
+        if (message is not null) request.Content = new StringContent(McpJson.Serialize(message), Encoding.UTF8, "application/json");
+        if (sessionId is not null) request.Headers.TryAddWithoutValidation("Mcp-Session-Id", sessionId);
+        if (ProtocolVersion is not null) request.Headers.TryAddWithoutValidation("MCP-Protocol-Version", ProtocolVersion);
         foreach (var (name, value) in config.Map("headers"))
+        {
+            if (request.Headers.TryGetValues(name, out _)) request.Headers.Remove(name);
             if (!request.Headers.TryAddWithoutValidation(name, value))
-                throw new InvalidDataException($"Invalid HTTP request header: {name}");
+            {
+                request.Content ??= new ByteArrayContent([]);
+                request.Content.Headers.Remove(name);
+                if (!request.Content.Headers.TryAddWithoutValidation(name, value))
+                    throw new InvalidDataException($"Invalid HTTP request header: {name}");
+            }
+        }
         request.Headers.Remove("Accept");
         if (method != HttpMethod.Get) request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-        if (sessionId is not null)
-        {
-            request.Headers.Remove("Mcp-Session-Id");
-            request.Headers.TryAddWithoutValidation("Mcp-Session-Id", sessionId);
-        }
-        if (ProtocolVersion is not null)
-        {
-            request.Headers.Remove("MCP-Protocol-Version");
-            request.Headers.TryAddWithoutValidation("MCP-Protocol-Version", ProtocolVersion);
-        }
+        if (message is not null) request.Content!.Headers.ContentType = new MediaTypeHeaderValue("application/json");
         return request;
     }
 
     public override async Task SendAsync(JsonObject message, CancellationToken cancellationToken)
     {
-        using var request = CreateRequest(HttpMethod.Post);
-        request.Content = new StringContent(message.ToJsonString(), Encoding.UTF8, "application/json");
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        using var request = CreateRequest(HttpMethod.Post, message);
+        using var response = await SendHttpAsync(request, cancellationToken);
         if (response.Headers.TryGetValues("Mcp-Session-Id", out var values)) sessionId = values.First();
         await EnsureSuccessAsync(response, cancellationToken);
         if (response.StatusCode == HttpStatusCode.Accepted) return;
@@ -75,11 +81,56 @@ public sealed class HttpTransport(ServerConfig config, RuntimeSettings settings)
         else if (contentType == "application/json")
         {
             var json = await response.Content.ReadAsStringAsync(cancellationToken);
-            if (JsonNode.Parse(json) is JsonArray batch)
-                foreach (var item in batch) await DeliverAsync(item?.ToJsonString() ?? "null", cancellationToken);
+            if (McpJson.Parse(json) is JsonArray batch)
+                foreach (var item in batch) await DeliverAsync(McpJson.Serialize(item), cancellationToken);
             else await DeliverAsync(json, cancellationToken);
         }
         else throw new InvalidDataException($"Unexpected MCP HTTP content type: {contentType ?? "(missing)"}");
+    }
+
+    private async Task<HttpResponseMessage> SendHttpAsync(HttpRequestMessage original, CancellationToken token)
+    {
+        var current = original;
+        HttpRequestMessage? redirected = null;
+        var body = original.Content is null ? null : await original.Content.ReadAsByteArrayAsync(token);
+        try
+        {
+            for (var redirects = 0; ; redirects++)
+            {
+                var response = await client.SendAsync(current, HttpCompletionOption.ResponseHeadersRead, token);
+                if ((int)response.StatusCode is not (301 or 302 or 303 or 307 or 308) || response.Headers.Location is null)
+                    return response;
+                using (response)
+                {
+                    if (redirects == 20) throw new HttpRequestException("Too many HTTP redirects");
+                    var target = new Uri(current.RequestUri!, response.Headers.Location);
+                    if (target.Scheme is not ("http" or "https")) throw new HttpRequestException("Invalid HTTP redirect scheme");
+                    var changeToGet = ((int)response.StatusCode is 301 or 302 && current.Method == HttpMethod.Post) ||
+                        ((int)response.StatusCode == 303 && current.Method != HttpMethod.Get && current.Method != HttpMethod.Head);
+                    var next = new HttpRequestMessage(changeToGet ? HttpMethod.Get : current.Method, target);
+                    var sameOrigin = Uri.Compare(current.RequestUri, target, UriComponents.SchemeAndServer,
+                        UriFormat.Unescaped, StringComparison.OrdinalIgnoreCase) == 0;
+                    foreach (var header in current.Headers)
+                    {
+                        if (!sameOrigin && header.Key.ToLowerInvariant() is "authorization" or "proxy-authorization" or "cookie" or "cookie2")
+                            continue;
+                        if (header.Key.Equals("Host", StringComparison.OrdinalIgnoreCase)) continue;
+                        next.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                    }
+                    if (changeToGet) body = null;
+                    if (body is not null)
+                    {
+                        next.Content = new ByteArrayContent(body);
+                        foreach (var header in current.Content!.Headers)
+                            next.Content.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                    }
+                    redirected?.Dispose();
+                    redirected = next;
+                    current = next;
+                }
+            }
+        }
+        finally { redirected?.Dispose(); }
     }
 
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
@@ -118,7 +169,7 @@ public sealed class HttpTransport(ServerConfig config, RuntimeSettings settings)
             {
                 using var request = CreateRequest(HttpMethod.Get);
                 if (!string.IsNullOrEmpty(state.LastId)) request.Headers.TryAddWithoutValidation("Last-Event-ID", state.LastId);
-                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+                using var response = await SendHttpAsync(request, token);
                 if (response.StatusCode == HttpStatusCode.MethodNotAllowed && expectedId is null) return;
                 await EnsureSuccessAsync(response, token);
                 if (response.Content.Headers.ContentType?.MediaType != "text/event-stream")
@@ -149,7 +200,7 @@ public sealed class HttpTransport(ServerConfig config, RuntimeSettings settings)
                 {
                     var json = data.ToString().TrimEnd('\n');
                     await DeliverAsync(json, cancellationToken);
-                    if (JsonNode.Parse(json) is JsonObject obj && obj["id"] is not null &&
+                    if (McpJson.Parse(json) is JsonObject obj && obj["id"] is not null &&
                         !obj.ContainsKey("method") && (expectedId is null || obj["id"]!.ToJsonString() == expectedId))
                     {
                         state.ReceivedResponse = true;

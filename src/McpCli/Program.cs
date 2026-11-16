@@ -21,7 +21,7 @@ if (args.Length > 0 && args[0] == "--daemon")
     try
     {
         if (args.Length != 3) throw new InvalidDataException("Invalid daemon invocation");
-        var value = JsonNode.Parse(await Console.In.ReadLineAsync(cancellation.Token) ?? "") as JsonObject ??
+        var value = McpJson.Parse(await Console.In.ReadLineAsync(cancellation.Token) ?? "") as JsonObject ??
             throw new InvalidDataException("Invalid daemon configuration");
         Configuration.ValidateServer(args[2], value);
         return await Daemon.RunAsync(args[1], args[2], new(value), settings, cancellation.Token);

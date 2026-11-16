@@ -99,4 +99,97 @@ public sealed class OutputSchemaTests
         StringAssert.Contains(result.Stderr, "requires task-based execution");
         Assert.IsFalse((await File.ReadAllLinesAsync(log)).Any(l => JsonNode.Parse(l)!["method"]?.ToString() == "tools/call"));
     }
+
+    [TestMethod]
+    [DataRow("""{"type":["string","number"],"nullable":true}""", "null", true)]
+    [DataRow("""{"type":["string","number"],"nullable":true,"enum":["only"]}""", "null", false)]
+    [DataRow("""{"type":"string","format":"url"}""", "\"urn:example:abc\"", false)]
+    [DataRow("""{"type":"string","format":"url"}""", "\"https://example.com/path\"", true)]
+    [DataRow("""{"type":"string","format":"url"}""", "\"http://127.0.0.1/path\"", false)]
+    [DataRow("""{"type":"string","format":"uuid"}""", "\"urn:uuid:123e4567-e89b-12d3-a456-426614174000\"", true)]
+    [DataRow("""{"type":"string","format":"uuid"}""", "\"urn:uuid:invalid\"", false)]
+    [DataRow("""{"type":"string","format":"date-time"}""", "\"2026-01-01T10:00:00+0000\"", true)]
+    [DataRow("""{"type":"string","format":"date-time"}""", "\"2026-01-01T10:00:00+00\"", true)]
+    [DataRow("""{"type":"string","format":"date-time"}""", "\"2026-01-01T10:00:00+24:00\"", false)]
+    [DataRow("""{"type":"string","format":"time"}""", "\"23:59:60Z\"", true)]
+    [DataRow("""{"type":"string","format":"time"}""", "\"12:00:60Z\"", false)]
+    [DataRow("""{"type":"string","format":"date"}""", "\"0000-02-29\"", true)]
+    [DataRow("""{"type":"number","multipleOf":0.1}""", "0.3", false)]
+    [DataRow("""{"type":"number","multipleOf":0.1}""", "0.2", true)]
+    public void ParitySchemaValidationMatchesRecordedUpstreamResults(string property, string value, bool expected)
+    {
+        var schema = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject { ["value"] = JsonNode.Parse(property) } };
+        Assert.AreEqual(expected, new OutputSchema(schema).IsValid(new JsonObject { ["value"] = JsonNode.Parse(value) }));
+    }
+
+    [TestMethod]
+    [DataRow("^.$", "\U0001F680", true)]
+    [DataRow("^..$", "\U0001F680", false)]
+    [DataRow("^.$", "\r", false)]
+    [DataRow("^.$", "\u2028", false)]
+    [DataRow("^a$", "a\n", false)]
+    [DataRow("^a$", "a\r\n", false)]
+    [DataRow("^\\p{Letter}+$", "abc", true)]
+    [DataRow("^\\p{Letter}+$", "\U00010400", true)]
+    [DataRow("^\\p{Letter}+$", "123", false)]
+    [DataRow("^\\P{Letter}+$", "\U0001F680", true)]
+    [DataRow("^[\\p{Letter}0-9]+$", "a\U000104001", true)]
+    [DataRow("^[^a]$", "\U0001F680", true)]
+    [DataRow("^[^a]{2}$", "\U0001F680", false)]
+    [DataRow("^\\u{1F680}{2}$", "\U0001F680\U0001F680", true)]
+    [DataRow("^\\.$", ".", true)]
+    public void ParitySchemaRegexUsesUnicodeCodePoints(string pattern, string value, bool expected)
+    {
+        var schema = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject
+        {
+            ["value"] = new JsonObject { ["type"] = "string", ["pattern"] = pattern }
+        }};
+        Assert.AreEqual(expected, new OutputSchema(schema).IsValid(new JsonObject { ["value"] = value }));
+    }
+
+    [TestMethod]
+    public void ParityReferencesCanTargetSchemasUnderExtensionKeywords()
+    {
+        var schema = JsonNode.Parse("""
+            {"type":"object","components":{"value":{"$ref":"#/definitions/inner"}},
+             "definitions":{"inner":{"type":"string"}},"properties":{"value":{"$ref":"#/components/value"}}}
+            """)!.AsObject();
+        var validator = new OutputSchema(schema);
+        Assert.IsTrue(validator.IsValid(JsonNode.Parse("""{"value":"ok"}""")));
+        Assert.IsFalse(validator.IsValid(JsonNode.Parse("""{"value":42}""")));
+    }
+
+    [TestMethod]
+    [DataRow("""{"type":"object","properties":{"value":{"type":"string","minLength":"1"}}}""")]
+    [DataRow("""{"type":"object","properties":{"value":{"type":"array","items":null}}}""")]
+    [DataRow("""{"type":"object","properties":{"value":{"nullable":true}}}""")]
+    public async Task ParityInvalidOutputSchemasFailDuringDiscovery(string schema)
+    {
+        await using var workspace = new TestWorkspace();
+        await workspace.WriteConfigAsync(("offline", workspace.StdioConfig(new JsonObject { ["FAKE_OUTPUT_SCHEMA"] = schema })));
+        var result = await workspace.RunAsync(["info", "offline"]);
+        Assert.AreEqual(1, result.ExitCode, result.Stdout);
+        StringAssert.Contains(result.Stderr, "output schema");
+    }
+
+    [TestMethod]
+    [DataRow("""{"type":["string","number"],"nullable":true}""", "null")]
+    [DataRow("""{"type":"string","pattern":"^\\p{Letter}+$"}""", "\"abc\"")]
+    [DataRow("""{"type":"string","pattern":"^.$"}""", "\"\\ud83d\\ude80\"")]
+    public async Task ParityCachedConnectionsAcceptValidStructuredResults(string property, string value)
+    {
+        await using var workspace = new TestWorkspace();
+        var schema = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject { ["value"] = JsonNode.Parse(property) } };
+        var server = workspace.StdioConfig(new JsonObject { ["FAKE_OUTPUT_SCHEMA"] = schema.ToJsonString() });
+        workspace.EnvironmentVariables["MCP_NO_DAEMON"] = "0";
+        workspace.EnvironmentVariables["MCP_DAEMON_TIMEOUT"] = "15";
+        workspace.TrackDaemon("offline", server);
+        await workspace.WriteConfigAsync(("offline", server));
+        var info = await workspace.RunAsync(["info", "offline"]);
+        Assert.AreEqual(0, info.ExitCode, info.Stderr);
+        var payload = new JsonObject { ["text"] = "valid", ["structured"] = new JsonObject { ["value"] = JsonNode.Parse(value) } };
+        var result = await workspace.RunAsync(["call", "offline", "echo"], payload.ToJsonString());
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        Assert.AreEqual("valid", result.Stdout.Trim());
+    }
 }

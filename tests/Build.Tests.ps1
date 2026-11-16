@@ -118,6 +118,7 @@ if (-not $psake.build_success) {
             'src/McpCli/McpCli.csproj', 'src/McpCli/Program.cs', 'src/McpCli/Cli.cs',
             'src/McpCli/CliArguments.cs', 'src/McpCli/CliError.cs', 'src/McpCli/Configuration.cs',
             'src/McpCli/Output.cs', 'src/McpCli/OutputSchema.cs', 'src/McpCli/Retry.cs',
+            'src/McpCli/SchemaRegex.cs', 'src/McpCli/McpJson.cs', 'src/McpCli/McpSchema.cs',
             'src/McpCli/McpConnection.cs', 'src/McpCli/RpcConnection.cs',
             'src/McpCli/StdioTransport.cs', 'src/McpCli/HttpTransport.cs', 'src/McpCli/Daemon.cs',
             'src/McpCli.Tests/McpCli.Tests.csproj', 'src/McpCli.Tests/TestWorkspace.cs',

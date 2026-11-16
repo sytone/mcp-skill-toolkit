@@ -72,7 +72,7 @@ public sealed record ServerConfig(JsonObject Value)
             _ => node?.DeepClone()
         };
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(
-            Canonicalize(Value)!.ToJsonString())))[..16];
+            McpJson.Serialize(Canonicalize(Value)))))[..16];
     }
 }
 
@@ -108,7 +108,7 @@ public static class Configuration
         JsonNode? root;
         try
         {
-            root = JsonNode.Parse(await File.ReadAllTextAsync(path, cancellationToken));
+            root = McpJson.Parse(await File.ReadAllTextAsync(path, cancellationToken));
         }
         catch (JsonException error)
         {

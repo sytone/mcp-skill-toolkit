@@ -34,6 +34,8 @@ and its local protocol test server. Do not edit generated skills.
 | `McpCli/StdioTransport.cs`, `HttpTransport.cs` | Child processes and Streamable HTTP/SSE |
 | `McpCli/Daemon.cs` | Per-user connection caching over framed named pipes |
 | `McpCli/OutputSchema.cs` | Cached structured-output validation |
+| `McpCli/SchemaRegex.cs` | Unicode code-point semantics for schema regex atoms |
+| `McpCli/McpJson.cs`, `McpSchema.cs` | Shared deep-JSON handling and MCP validation/normalization |
 | `McpCli.Tests/` | Unit and child-process compatibility tests |
 | `McpCli.TestServer/` | Independent offline stdio/loopback HTTP fixture |
 
@@ -65,6 +67,12 @@ Transport changes must preserve request IDs, notifications, UTF-8 framing,
 HTTP session/protocol headers, and cancellation/timeout ownership. Do not
 replay a POST to resume an SSE response. Tool retries are a separate upstream
 behavior and can be disabled with `MCP_MAX_RETRIES=0`.
+
+Keep the `Parity*` regression cases in the existing MSTest files. Their
+expectations come from the pinned upstream CLI/SDK, not from the port itself.
+Cancellation tests must observe the notification and cancellation at the
+server; local task cancellation alone is insufficient. Never infer network
+error codes from an MCP error's message text.
 
 When adding source or tests, extend the explicit allowlists in
 `../psakefile.ps1` and `../tests/Build.Tests.ps1`. Never package `bin/`, `obj/`,

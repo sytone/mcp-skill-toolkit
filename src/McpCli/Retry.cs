@@ -18,8 +18,7 @@ public static class Retry
         return Regex.IsMatch(error.Message,
             @"^(502|503|504|429)\b|\b(http|status(\s+code)?)\s*(502|503|504|429)\b|" +
             @"\b(502|503|504|429)\s+(bad gateway|service unavailable|gateway timeout|too many requests)|" +
-            @"network\s*(error|fail|unavailable|timeout)|connection\s*(reset|refused|timeout)|\btimeout\b|" +
-            @"\b(ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EPIPE|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN)\b",
+            @"network\s*(error|fail|unavailable|timeout)|connection\s*(reset|refused|timeout)|\btimeout\b",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     }
 

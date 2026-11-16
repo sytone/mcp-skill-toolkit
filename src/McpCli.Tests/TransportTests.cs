@@ -273,4 +273,295 @@ public sealed class TransportTests
     }
 
     private static string Normalize(string value) => value.Replace("\r\n", "\n");
+
+    [TestMethod]
+    [DataRow(".")]
+    [DataRow("relative-working-directory")]
+    public async Task ParityRelativeWorkingDirectoryIsResolvedFromCaller(string cwd)
+    {
+        await using var workspace = new TestWorkspace();
+        var expected = Path.GetFullPath(cwd, workspace.Root);
+        Directory.CreateDirectory(expected);
+        var server = workspace.StdioConfig();
+        server.Value["cwd"] = cwd;
+        await workspace.WriteConfigAsync(("offline", server));
+        var result = await workspace.RunAsync(["call", "offline", "state", "{}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        Assert.AreEqual(expected, JsonNode.Parse(result.Stdout)!["cwd"]!.GetValue<string>());
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task ParityNetworkCodeInRpcErrorDoesNotReplayTool(bool daemon)
+    {
+        await using var workspace = new TestWorkspace();
+        var log = Path.Combine(workspace.Root, "requests.jsonl");
+        var server = workspace.StdioConfig(new JsonObject { ["FAKE_REQUEST_LOG"] = log });
+        await workspace.WriteConfigAsync(("offline", server));
+        workspace.EnvironmentVariables["MCP_MAX_RETRIES"] = "1";
+        workspace.EnvironmentVariables["MCP_RETRY_DELAY"] = "1";
+        if (daemon)
+        {
+            workspace.EnvironmentVariables["MCP_NO_DAEMON"] = "0";
+            workspace.TrackDaemon("offline", server);
+        }
+        var result = await workspace.RunAsync(["call", "offline", "error_code_text", "{}"]);
+        Assert.AreEqual(2, result.ExitCode, result.Stdout);
+        StringAssert.Contains(result.Stderr, "EPIPE while validating input");
+        Assert.AreEqual(1, (await File.ReadAllLinesAsync(log)).Count(l => JsonNode.Parse(l)!["method"]?.ToString() == "tools/call"));
+    }
+
+    [TestMethod]
+    [DataRow("stdio")]
+    [DataRow("http")]
+    [DataRow("daemon")]
+    public async Task ParityTimeoutCancelsTheOperationAtTheServer(string transport)
+    {
+        await using var workspace = new TestWorkspace();
+        var log = Path.Combine(workspace.Root, "requests.jsonl");
+        var server = transport == "http" ?
+            await workspace.StartHttpAsync(new() { ["FAKE_REQUEST_LOG"] = log }) :
+            workspace.StdioConfig(new JsonObject { ["FAKE_REQUEST_LOG"] = log });
+        await workspace.WriteConfigAsync(("offline", server));
+        workspace.EnvironmentVariables["MCP_TIMEOUT"] = "1";
+        if (transport == "daemon")
+        {
+            workspace.EnvironmentVariables["MCP_NO_DAEMON"] = "0";
+            workspace.TrackDaemon("offline", server);
+        }
+        var result = await workspace.RunAsync(["call", "offline", "cancellable", "{}"]);
+        Assert.AreEqual(2, result.ExitCode, result.Stderr);
+        var messages = (await File.ReadAllLinesAsync(log)).Select(l => JsonNode.Parse(l)!).ToArray();
+        var call = messages.Single(m => m["method"]?.ToString() == "tools/call");
+        var cancellation = messages.SingleOrDefault(m => m["method"]?.ToString() == "notifications/cancelled");
+        Assert.IsNotNull(cancellation, "The server must receive cancellation, not just a disconnected local waiter.");
+        Assert.AreEqual(call["id"]!.ToJsonString(), cancellation["params"]!["requestId"]!.ToJsonString());
+        Assert.IsTrue(messages.Any(m => m["method"]?.ToString() == "fixture/cancelled"));
+        Assert.IsFalse(messages.Any(m => m["method"]?.ToString() == "fixture/completed"));
+    }
+
+    [TestMethod]
+    public async Task ParityHttpConfigurationHeadersOverrideNegotiatedDefaults()
+    {
+        await using var workspace = new TestWorkspace();
+        var server = await workspace.StartHttpAsync(new()
+        {
+            ["FAKE_EXPECT_SESSION_ID"] = "configured",
+            ["FAKE_EXPECT_PROTOCOL_VERSION"] = "2024-11-05"
+        });
+        server.Value["headers"] = new JsonObject
+        {
+            ["Content-Type"] = "application/json",
+            ["mcp-session-id"] = "configured",
+            ["mcp-protocol-version"] = "2024-11-05"
+        };
+        await workspace.WriteConfigAsync(("http", server));
+        var result = await workspace.RunAsync(["call", "http", "echo", "{}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        Assert.AreEqual("{}", result.Stdout.Trim());
+    }
+
+    [TestMethod]
+    [DataRow("gzip", "json")]
+    [DataRow("deflate", "json")]
+    [DataRow("br", "json")]
+    [DataRow("gzip", "sse")]
+    public async Task ParityHttpDecompressesJsonAndEventStreams(string compression, string mode)
+    {
+        await using var workspace = new TestWorkspace();
+        var server = await workspace.StartHttpAsync(new() { ["FAKE_HTTP_COMPRESSION"] = compression, ["FAKE_HTTP_MODE"] = mode });
+        server.Value["headers"] = new JsonObject { ["Accept-Encoding"] = compression };
+        await workspace.WriteConfigAsync(("http", server));
+        var result = await workspace.RunAsync(["call", "http", "echo", "{\"text\":\"decoded\"}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        Assert.AreEqual("decoded", result.Stdout.Trim());
+    }
+
+    [TestMethod]
+    [DataRow(307)]
+    [DataRow(308)]
+    public async Task ParitySameOriginRedirectPreservesAuthorizationAndPayload(int status)
+    {
+        await using var workspace = new TestWorkspace();
+        var server = await workspace.StartHttpAsync(new()
+        {
+            ["FAKE_HTTP_AUTH"] = "Bearer public-fixture",
+            ["FAKE_REDIRECT_STATUS"] = status.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        });
+        server.Value["url"] = server.Url.Replace("/mcp", "/redirect");
+        server.Value["headers"] = new JsonObject { ["Authorization"] = "Bearer public-fixture" };
+        await workspace.WriteConfigAsync(("http", server));
+        var result = await workspace.RunAsync(["call", "http", "echo", "{\"text\":\"redirected\"}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        Assert.AreEqual("redirected", result.Stdout.Trim());
+    }
+
+    [TestMethod]
+    public async Task ParityCrossOriginRedirectDoesNotForwardAuthorization()
+    {
+        await using var workspace = new TestWorkspace();
+        var log = Path.Combine(workspace.Root, "headers.jsonl");
+        var target = await workspace.StartHttpAsync(new() { ["FAKE_HTTP_HEADERS_LOG"] = log });
+        var source = await workspace.StartHttpAsync(new() { ["FAKE_REDIRECT_TARGET"] = target.Url });
+        source.Value["url"] = source.Url.Replace("/mcp", "/redirect");
+        source.Value["headers"] = new JsonObject { ["Authorization"] = "Bearer public-fixture" };
+        await workspace.WriteConfigAsync(("http", source));
+        var result = await workspace.RunAsync(["call", "http", "echo", "{}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        foreach (var entry in await File.ReadAllLinesAsync(log))
+            Assert.AreEqual("", JsonNode.Parse(entry)!["authorization"]!.GetValue<string>());
+    }
+
+    [TestMethod]
+    public async Task ParityMalformedStdioLineDoesNotDiscardFollowingResponse()
+    {
+        await using var workspace = new TestWorkspace();
+        await workspace.WriteConfigAsync(("offline", workspace.StdioConfig(new JsonObject
+        {
+            ["FAKE_STDOUT_PREFIX"] = "Starting local test service...\n{not-json}"
+        })));
+        workspace.EnvironmentVariables["MCP_DEBUG"] = "1";
+        var result = await workspace.RunAsync(["call", "offline", "echo", "{}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        Assert.AreEqual("{}", result.Stdout.Trim());
+        StringAssert.Contains(result.Stderr, "Ignoring malformed stdio message");
+    }
+
+    [TestMethod]
+    [DataRow("""{"inputSchema":{"type":"object","required":[42]}}""")]
+    [DataRow("""{"inputSchema":{"type":"object","properties":{"x":false}}}""")]
+    [DataRow("""{"outputSchema":null}""")]
+    [DataRow("""{"annotations":{"readOnlyHint":"yes"}}""")]
+    [DataRow("""{"icons":[{"src":"https://example.invalid/icon","sizes":[42]}]}""")]
+    public async Task ParityInvalidToolMetadataIsRejected(string overrides)
+    {
+        await using var workspace = new TestWorkspace();
+        await workspace.WriteConfigAsync(("offline", workspace.StdioConfig(new JsonObject { ["FAKE_TOOL_OVERRIDES"] = overrides })));
+        var result = await workspace.RunAsync(["info", "offline"]);
+        Assert.AreEqual(1, result.ExitCode, result.Stdout);
+        Assert.AreEqual("", result.Stdout);
+        StringAssert.Contains(result.Stderr, "Invalid MCP response");
+    }
+
+    [TestMethod]
+    [DataRow("""{"content":[{"type":"resource","resource":{"uri":"file:///public.txt","text":"ok","mimeType":42}}]}""")]
+    [DataRow("""{"content":[{"type":"image","data":"not base64!","mimeType":"image/png"}]}""")]
+    [DataRow("""{"content":[{"type":"resource_link","name":"x","uri":"file:///public.txt","annotations":{"priority":2}}]}""")]
+    [DataRow("""{"content":[{"type":"text","text":"ok","annotations":{"audience":["system"]}}]}""")]
+    public async Task ParityInvalidNestedContentIsRejected(string response)
+    {
+        await using var workspace = new TestWorkspace();
+        await workspace.WriteConfigAsync(("offline", workspace.StdioConfig(new JsonObject { ["FAKE_TOOL_RESULT"] = response })));
+        var result = await workspace.RunAsync(["call", "offline", "echo", "{}"]);
+        Assert.AreEqual(2, result.ExitCode, result.Stdout);
+        Assert.AreEqual("", result.Stdout);
+        StringAssert.Contains(result.Stderr, "TOOL_EXECUTION_FAILED");
+    }
+
+    [TestMethod]
+    public async Task ParityContentNormalizationStripsUnknownFieldsButPreservesMeta()
+    {
+        await using var workspace = new TestWorkspace();
+        const string response = """
+            {"content":[{"type":"image","data":"AA","mimeType":"image/png","extra":"discard","_meta":{"extra":"keep"},
+            "annotations":{"priority":0.5,"extra":"discard"}}],"extra":"root extension"}
+            """;
+        await workspace.WriteConfigAsync(("offline", workspace.StdioConfig(new JsonObject { ["FAKE_TOOL_RESULT"] = response })));
+        var result = await workspace.RunAsync(["call", "offline", "echo", "{}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        var normalized = JsonNode.Parse(result.Stdout)!;
+        var block = normalized["content"]![0]!.AsObject();
+        Assert.IsFalse(block.ContainsKey("extra"));
+        Assert.IsFalse(block["annotations"]!.AsObject().ContainsKey("extra"));
+        Assert.AreEqual("keep", block["_meta"]!["extra"]!.GetValue<string>());
+        Assert.AreEqual("root extension", normalized["extra"]!.GetValue<string>());
+        Assert.AreEqual("AA", block["data"]!.GetValue<string>());
+    }
+
+    [TestMethod]
+    [DataRow("call")]
+    [DataRow("info")]
+    public async Task ParityMissingToolsCapabilityDoesNotEnableStrictEnforcement(string command)
+    {
+        await using var workspace = new TestWorkspace();
+        await workspace.WriteConfigAsync(("offline", workspace.StdioConfig(new JsonObject { ["FAKE_NO_TOOLS"] = "1" })));
+        var result = await workspace.RunAsync(command == "info" ? ["info", "offline"] : ["call", "offline", "echo", "{}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        if (command == "info") StringAssert.Contains(result.Stdout, "echo");
+        else Assert.AreEqual("{}", result.Stdout.Trim());
+    }
+
+    [TestMethod]
+    [DataRow("stdio", 70)]
+    [DataRow("http", 150)]
+    [DataRow("daemon", 150)]
+    public async Task ParityDeepJsonSurvivesConfigurationTransportAndResult(string transport, int depth)
+    {
+        await using var workspace = new TestWorkspace();
+        var json = string.Concat(Enumerable.Repeat("{\"nested\":", depth)) + "{}" + new string('}', depth);
+        var options = new System.Text.Json.JsonDocumentOptions { MaxDepth = int.MaxValue };
+        var server = transport == "http" ? await workspace.StartHttpAsync() : workspace.StdioConfig();
+        server.Value["extension"] = JsonNode.Parse(json, documentOptions: options);
+        await workspace.WriteConfigAsync(("offline", server));
+        if (transport == "daemon")
+        {
+            workspace.EnvironmentVariables["MCP_NO_DAEMON"] = "0";
+            workspace.TrackDaemon("offline", server);
+        }
+        var result = await workspace.RunAsync(["call", "offline", "echo"], json);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        Assert.AreEqual(json, result.Stdout.Trim());
+    }
+
+    [TestMethod]
+    [DataRow("stdio")]
+    [DataRow("http")]
+    [DataRow("daemon")]
+    public async Task ParityDeepStructuredResultSurvivesNormalizationAndOutput(string transport)
+    {
+        await using var workspace = new TestWorkspace();
+        var json = string.Concat(Enumerable.Repeat("{\"nested\":", 150)) + "{}" + new string('}', 150);
+        var response = "{\"structuredContent\":" + json + "}";
+        var server = transport == "http" ?
+            await workspace.StartHttpAsync(new() { ["FAKE_TOOL_RESULT"] = response }) :
+            workspace.StdioConfig(new JsonObject { ["FAKE_TOOL_RESULT"] = response });
+        await workspace.WriteConfigAsync(("offline", server));
+        if (transport == "daemon")
+        {
+            workspace.EnvironmentVariables["MCP_NO_DAEMON"] = "0";
+            workspace.TrackDaemon("offline", server);
+        }
+        var result = await workspace.RunAsync(["call", "offline", "echo", "{}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        var options = new System.Text.Json.JsonDocumentOptions { MaxDepth = int.MaxValue };
+        var parsed = JsonNode.Parse(result.Stdout, documentOptions: options)!;
+        Assert.IsTrue(JsonNode.DeepEquals(JsonNode.Parse(json, documentOptions: options), parsed["structuredContent"]));
+        StringAssert.StartsWith(Normalize(result.Stdout), "{\n  \"content\": [],\n  \"structuredContent\":");
+    }
+
+    [TestMethod]
+    public async Task ParityRedirectLoopIsBounded()
+    {
+        await using var workspace = new TestWorkspace();
+        var server = await workspace.StartHttpAsync(new() { ["FAKE_REDIRECT_TARGET"] = "/redirect" });
+        server.Value["url"] = server.Url.Replace("/mcp", "/redirect");
+        await workspace.WriteConfigAsync(("http", server));
+        var result = await workspace.RunAsync(["info", "http"]);
+        Assert.AreEqual(3, result.ExitCode);
+        StringAssert.Contains(result.Stderr, "Too many HTTP redirects");
+    }
+
+    [TestMethod]
+    [DataRow("\"\"", "any")]
+    [DataRow("[]", "")]
+    public async Task ParityParameterTypeFormattingPreservesUpstreamFallback(string type, string expected)
+    {
+        await using var workspace = new TestWorkspace();
+        var overrides = "{\"inputSchema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":" + type + "}}}}";
+        await workspace.WriteConfigAsync(("offline", workspace.StdioConfig(new JsonObject { ["FAKE_TOOL_OVERRIDES"] = overrides })));
+        var result = await workspace.RunAsync(["info", "offline"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        StringAssert.Contains(result.Stdout, $"value ({expected}, optional)");
+    }
 }

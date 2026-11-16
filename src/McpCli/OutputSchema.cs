@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Net;
-using System.Net.Mail;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -15,6 +14,8 @@ public sealed class OutputSchema
     private readonly Dictionary<string, JsonNode> references = new(StringComparer.Ordinal);
     private readonly Dictionary<JsonNode, Uri> bases = new(ReferenceEqualityComparer.Instance);
     private readonly HashSet<(JsonNode Schema, JsonNode? Value)> evaluating = [];
+    private readonly Queue<JsonNode> pendingSchemas = new();
+    private readonly Dictionary<string, Regex> patterns = new(StringComparer.Ordinal);
     private static readonly Uri DefaultBase = new("https://mcp-cli.invalid/schema");
     private static readonly string[] SchemaMaps = ["properties", "patternProperties", "definitions", "$defs"];
     private static readonly string[] SchemaSingles =
@@ -27,14 +28,21 @@ public sealed class OutputSchema
         root = schema;
         this.registry = registry;
         Index(schema, DefaultBase);
-        foreach (var node in bases.Keys.OfType<JsonObject>())
-        {
-            if (node["$ref"] is { } reference) _ = Resolve(node, reference.GetValue<string>());
-            if (node["pattern"] is { } pattern) _ = Pattern(pattern.GetValue<string>());
-            if (node["patternProperties"] is JsonObject patterns)
-                foreach (var name in patterns.Select(p => p.Key)) _ = Pattern(name);
-        }
+        CompilePendingSchemas();
         foreach (var id in references.Keys) registry.TryAdd(id, this);
+    }
+
+    private void CompilePendingSchemas()
+    {
+        while (pendingSchemas.TryDequeue(out var pending))
+        {
+            if (pending is not JsonObject node) continue;
+            ValidateKeywordTypes(node);
+            if (node["$ref"] is { } reference) _ = Resolve(node, reference.GetValue<string>());
+            if (node["pattern"] is { } pattern) CompilePattern(pattern.GetValue<string>());
+            if (node["patternProperties"] is JsonObject properties)
+                foreach (var name in properties.Select(p => p.Key)) CompilePattern(name);
+        }
     }
 
     public static OutputSchema Compile(JsonObject schema, IDictionary<string, OutputSchema> registry)
@@ -49,6 +57,7 @@ public sealed class OutputSchema
 
     private void Index(JsonNode schema, Uri baseUri)
     {
+        if (bases.ContainsKey(schema)) return;
         if (schema is JsonObject obj && obj["$id"] is { } id)
         {
             baseUri = new Uri(baseUri, id.GetValue<string>());
@@ -56,6 +65,7 @@ public sealed class OutputSchema
                 throw new InvalidDataException($"Duplicate output schema ID: {baseUri}");
         }
         bases[schema] = baseUri;
+        pendingSchemas.Enqueue(schema);
         if (schema is not JsonObject map) return;
         foreach (var key in SchemaMaps)
             if (map[key] is JsonObject properties)
@@ -100,7 +110,15 @@ public sealed class OutputSchema
                 _ => null
             };
         }
-        return (this, target ?? throw new InvalidDataException($"Unresolved output schema reference: {reference}"));
+        if (target is null) throw new InvalidDataException($"Unresolved output schema reference: {reference}");
+        if (!bases.ContainsKey(target))
+        {
+            var ancestor = target.Parent;
+            while (ancestor is not null && !bases.ContainsKey(ancestor)) ancestor = ancestor.Parent;
+            Index(target, ancestor is null ? bases[source] : bases[ancestor]);
+            CompilePendingSchemas();
+        }
+        return (this, target);
     }
 
     public bool IsValid(JsonNode? value)
@@ -124,12 +142,13 @@ public sealed class OutputSchema
                 var (owner, target) = Resolve(schema, reference.GetValue<string>());
                 if (!owner.Validate(target, value)) return false;
             }
+            var nullable = value is null && rules["nullable"]?.ToString() == "true";
             if (rules["type"] is JsonArray types)
             {
-                if (!types.Any(t => MatchesType(t!.GetValue<string>(), value))) return false;
+                if (!nullable && !types.Any(t => MatchesType(t!.GetValue<string>(), value))) return false;
             }
             else if (rules["type"] is { } type && !MatchesType(type.GetValue<string>(), value) &&
-                !(value is null && rules["nullable"]?.ToString() == "true")) return false;
+                !nullable) return false;
             if (rules.ContainsKey("const") && !JsonNode.DeepEquals(rules["const"], value)) return false;
             if (rules["enum"] is JsonArray choices && !choices.Any(c => JsonNode.DeepEquals(c, value))) return false;
             if (rules["allOf"] is JsonArray all && !all.All(s => Validate(s!, value))) return false;
@@ -148,7 +167,7 @@ public sealed class OutputSchema
                 var text = value.GetValue<string>();
                 var length = text.EnumerateRunes().Count();
                 if (Below(rules, "minLength", length) || Above(rules, "maxLength", length)) return false;
-                if (rules["pattern"] is { } pattern && !Pattern(pattern.GetValue<string>()).IsMatch(text)) return false;
+                if (rules["pattern"] is { } pattern && !patterns[pattern.GetValue<string>()].IsMatch(text)) return false;
                 if (rules["format"] is { } format && !ValidFormat(format.GetValue<string>(), text)) return false;
             }
             if (value?.GetValueKind() == JsonValueKind.Number)
@@ -162,7 +181,7 @@ public sealed class OutputSchema
                     var divisor = Number(multiple);
                     if (divisor <= 0) throw new InvalidDataException("Output schema multipleOf must be positive");
                     var quotient = number / divisor;
-                    if (Math.Abs(quotient - Math.Round(quotient)) > 1e-12 * Math.Max(1, Math.Abs(quotient))) return false;
+                    if (!double.IsFinite(quotient) || quotient != Math.Truncate(quotient)) return false;
                 }
                 if (rules["format"]?.ToString() == "int32" && (number < int.MinValue || number > int.MaxValue || number != Math.Truncate(number))) return false;
                 if (rules["format"]?.ToString() == "int64" && number != Math.Truncate(number)) return false;
@@ -188,7 +207,7 @@ public sealed class OutputSchema
             if (rules["patternProperties"] is JsonObject patterns)
             {
                 foreach (var (pattern, propertySchema) in patterns)
-                    if (Pattern(pattern).IsMatch(name))
+                    if (this.patterns[pattern].IsMatch(name))
                     {
                         matched = true;
                         if (!Validate(propertySchema!, item)) return false;
@@ -244,33 +263,79 @@ public sealed class OutputSchema
     private static double Number(JsonNode node) => double.Parse(node.ToJsonString(), CultureInfo.InvariantCulture);
     private static bool Below(JsonObject rules, string key, double value) => rules[key] is { } limit && value < Number(limit);
     private static bool Above(JsonObject rules, string key, double value) => rules[key] is { } limit && value > Number(limit);
-    private static Regex Pattern(string pattern) => new(pattern, RegexOptions.ECMAScript | RegexOptions.CultureInvariant,
+    private static Regex Pattern(string pattern, bool ignoreCase = false) => new(pattern,
+        RegexOptions.ECMAScript | RegexOptions.CultureInvariant | (ignoreCase ? RegexOptions.IgnoreCase : RegexOptions.None),
         TimeSpan.FromSeconds(1));
+
+    private void CompilePattern(string pattern)
+    {
+        if (!patterns.ContainsKey(pattern)) patterns.Add(pattern, SchemaRegex.Compile(pattern));
+    }
+
+    private static void ValidateKeywordTypes(JsonObject schema)
+    {
+        static bool IsSchema(JsonNode? node) => node is JsonObject || node?.GetValueKind() is JsonValueKind.True or JsonValueKind.False;
+        static bool Strings(JsonNode? node) => node is JsonArray array && array.All(v => v?.GetValueKind() == JsonValueKind.String);
+        static void Require(bool valid, string keyword)
+        {
+            if (!valid) throw new InvalidDataException($"Invalid output schema keyword: {keyword}");
+        }
+        foreach (var (key, value) in schema)
+        {
+            switch (key)
+            {
+                case "type":
+                    var types = value is JsonArray array ? array.ToArray() : [value];
+                    Require(types.Length > 0 && types.All(t => t?.GetValueKind() == JsonValueKind.String &&
+                        t.GetValue<string>() is "null" or "object" or "array" or "string" or "number" or "integer" or "boolean"), key);
+                    break;
+                case "nullable":
+                    Require(value?.GetValueKind() is JsonValueKind.True or JsonValueKind.False && schema.ContainsKey("type"), key);
+                    break;
+                case "minLength" or "maxLength" or "minItems" or "maxItems" or "minProperties" or "maxProperties" or
+                    "minimum" or "maximum" or "exclusiveMinimum" or "exclusiveMaximum" or "multipleOf":
+                    Require(value?.GetValueKind() == JsonValueKind.Number, key);
+                    break;
+                case "pattern" or "format" or "$ref" or "$id": Require(value?.GetValueKind() == JsonValueKind.String, key); break;
+                case "uniqueItems": Require(value?.GetValueKind() is JsonValueKind.True or JsonValueKind.False, key); break;
+                case "required": Require(Strings(value), key); break;
+                case "enum": Require(value is JsonArray { Count: > 0 }, key); break;
+                case "properties" or "patternProperties" or "definitions" or "$defs":
+                    Require(value is JsonObject obj && obj.All(p => IsSchema(p.Value)), key);
+                    break;
+                case "allOf" or "anyOf" or "oneOf": Require(value is JsonArray schemas && schemas.All(IsSchema), key); break;
+                case "items": Require(IsSchema(value) || value is JsonArray items && items.All(IsSchema), key); break;
+                case "additionalProperties" or "additionalItems" or "contains" or "propertyNames" or "not" or "if" or "then" or "else":
+                    Require(IsSchema(value), key);
+                    break;
+                case "dependencies": Require(value is JsonObject dependencies && dependencies.All(p => Strings(p.Value) || IsSchema(p.Value)), key); break;
+            }
+        }
+    }
 
     private static bool ValidFormat(string format, string text)
     {
         switch (format)
         {
-            case "date": return DateOnly.TryParseExact(text, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _);
-            case "time": return Pattern(@"^(?:[01]\d|2[0-3]):[0-5]\d:(?:[0-5]\d|60)(?:\.\d+)?(?:[zZ]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$").IsMatch(text);
-            case "iso-time": return Pattern(@"^(?:[01]\d|2[0-3]):[0-5]\d:(?:[0-5]\d|60)(?:\.\d+)?(?:[zZ]|[+-](?:[01]\d|2[0-3]):[0-5]\d)?$").IsMatch(text);
+            case "date": return ValidDate(text);
+            case "time": return ValidTime(text, requireTimeZone: true);
+            case "iso-time": return ValidTime(text, requireTimeZone: false);
             case "date-time":
             case "iso-date-time":
-                var separator = text.IndexOfAny(['T', 't', ' ']);
-                return separator > 0 && ValidFormat("date", text[..separator]) &&
-                    ValidFormat(format == "date-time" ? "time" : "iso-time", text[(separator + 1)..]);
+                var dateTimeParts = Regex.Split(text, @"[tT\s]");
+                return dateTimeParts.Length == 2 && ValidDate(dateTimeParts[0]) && ValidTime(dateTimeParts[1], format == "date-time");
             case "duration": return Pattern(@"^P(?=\d|T\d)(?:\d+Y)?(?:\d+M)?(?:\d+D)?(?:T(?=\d)(?:\d+H)?(?:\d+M)?(?:\d+S)?)?$|^P\d+W$").IsMatch(text);
-            case "email": return MailAddress.TryCreate(text, out var mail) && mail.Address == text && text.Contains('@');
+            case "email": return Pattern(@"^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", true).IsMatch(text);
             case "hostname": return text.Length <= 253 && text.TrimEnd('.').Split('.').All(label =>
                 Pattern(@"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$").IsMatch(label));
             case "ipv4": return text.Split('.') is { Length: 4 } parts &&
                 parts.All(p => Pattern(@"^(0|[1-9]\d{0,2})$").IsMatch(p) && int.Parse(p) <= 255);
             case "ipv6": return IPAddress.TryParse(text, out var address) && address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
-            case "uri":
-            case "url": return !text.Any(char.IsWhiteSpace) && Uri.TryCreate(text, UriKind.Absolute, out _);
+            case "uri": return !text.Any(char.IsWhiteSpace) && Uri.TryCreate(text, UriKind.Absolute, out _);
+            case "url": return Pattern(@"^(?:https?|ftp)://(?:\S+(?::\S*)?@)?(?:(?!(?:10|127)(?:\.\d{1,3}){3})(?!(?:169\.254|192\.168)(?:\.\d{1,3}){2})(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?:[1-9]\d?|1\d\d|2[01]\d|22[0-3])(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5])){2}(?:\.(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-4]))|(?:(?:[a-z0-9\u00a1-\uffff]+-)*[a-z0-9\u00a1-\uffff]+)(?:\.(?:[a-z0-9\u00a1-\uffff]+-)*[a-z0-9\u00a1-\uffff]+)*(?:\.(?:[a-z\u00a1-\uffff]{2,})))(?::\d{2,5})?(?:/[^\s]*)?$", true).IsMatch(text);
             case "uri-reference": return !text.Any(char.IsWhiteSpace) && Uri.TryCreate(text, UriKind.RelativeOrAbsolute, out _);
             case "uri-template": return Pattern(@"^(?:[^{}\s]|\{[+#./;?&=,!@|]?[a-zA-Z0-9_%]+(?::[1-9]\d{0,3}|\*)?(?:,[a-zA-Z0-9_%]+(?::[1-9]\d{0,3}|\*)?)*\})*$").IsMatch(text);
-            case "uuid": return Guid.TryParseExact(text, "D", out _);
+            case "uuid": return Pattern(@"^(?:urn:uuid:)?[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$", true).IsMatch(text);
             case "json-pointer": return Pattern(@"^(?:/(?:[^~/]|~[01])*)*$").IsMatch(text);
             case "relative-json-pointer": return Pattern(@"^(?:0|[1-9]\d*)(?:#|(?:/(?:[^~/]|~[01])*)*)$").IsMatch(text);
             case "byte": return Pattern(@"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$").IsMatch(text);
@@ -279,5 +344,36 @@ public sealed class OutputSchema
                 catch (ArgumentException) { return false; }
             default: return true; // Unknown formats are annotations in upstream AJV's non-strict mode.
         }
+    }
+
+    private static bool ValidDate(string text)
+    {
+        var match = Pattern(@"^(\d{4})-(\d\d)-(\d\d)$").Match(text);
+        if (!match.Success) return false;
+        var year = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+        var month = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
+        var day = int.Parse(match.Groups[3].Value, CultureInfo.InvariantCulture);
+        int[] days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        var leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        return month is >= 1 and <= 12 && day >= 1 && day <= (month == 2 && leap ? 29 : days[month]);
+    }
+
+    private static bool ValidTime(string text, bool requireTimeZone)
+    {
+        var match = Pattern(@"^(\d\d):(\d\d):(\d\d(?:\.\d+)?)(z|([+-])(\d\d)(?::?(\d\d))?)?$", true).Match(text);
+        if (!match.Success) return false;
+        double Value(int group) => match.Groups[group].Success ?
+            double.Parse(match.Groups[group].Value, CultureInfo.InvariantCulture) : 0;
+        var hour = Value(1);
+        var minute = Value(2);
+        var second = Value(3);
+        var sign = match.Groups[5].Value == "-" ? -1 : 1;
+        var zoneHour = Value(6);
+        var zoneMinute = Value(7);
+        if (zoneHour > 23 || zoneMinute > 59 || (requireTimeZone && !match.Groups[4].Success)) return false;
+        if (hour <= 23 && minute <= 59 && second < 60) return true;
+        var utcMinute = minute - zoneMinute * sign;
+        var utcHour = hour - zoneHour * sign - (utcMinute < 0 ? 1 : 0);
+        return utcHour is 23 or -1 && utcMinute is 59 or -1 && second < 61;
     }
 }

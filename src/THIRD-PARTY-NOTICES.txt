@@ -13,6 +13,14 @@ cross-spawn 7.0.6 (Windows argument escaping convention)
 https://github.com/moxystudio/node-cross-spawn
 Copyright (c) 2018 Made With MOXY Lda <hello@moxy.studio>
 
+ajv-formats 3.0.1 (schema format validation)
+https://github.com/ajv-validator/ajv-formats
+Copyright (c) 2020 Evgeny Poberezkin
+
+URL validation expression used by ajv-formats
+https://gist.github.com/dperini/729294
+Copyright (c) 2010-2018 Diego Perini (http://www.iport.it)
+
 The following MIT license applies to the upstream works listed above.
 Original JavaScript packages and Bun are not shipped with this port.
 
