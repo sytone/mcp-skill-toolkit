@@ -192,4 +192,66 @@ public sealed class OutputSchemaTests
         Assert.AreEqual(0, result.ExitCode, result.Stderr);
         Assert.AreEqual("valid", result.Stdout.Trim());
     }
+
+    [TestMethod]
+    [DataRow("""{"type":"object","definitions":{"unused":{"$ref":"https://example.invalid/not-loaded"}}}""")]
+    [DataRow("""{"type":"object","definitions":{"unused":{"pattern":"["}}}""")]
+    public void RoundTwoUnusedDefinitionsAreNotCompiled(string schema) =>
+        Assert.IsTrue(new OutputSchema(JsonNode.Parse(schema)!.AsObject()).IsValid(new JsonObject()));
+
+    [TestMethod]
+    [DataRow("""{"type":"object","properties":{"value":{"type":["string","null"],"nullable":false}}}""")]
+    [DataRow("""{"type":"object","properties":{"value":{"type":"null","nullable":false}}}""")]
+    [DataRow("""{"type":"object","definitions":{"used":{"pattern":"["}},"properties":{"value":{"$ref":"#/definitions/used"}}}""")]
+    public void RoundTwoInvalidReachableSchemasAreRejected(string schema) =>
+        Assert.ThrowsExactly<InvalidDataException>(() => new OutputSchema(JsonNode.Parse(schema)!.AsObject()));
+
+    [TestMethod]
+    [DataRow("^[\\q]$")]
+    [DataRow("^\\q$")]
+    [DataRow("\\1")]
+    [DataRow("(?i)abc")]
+    public void RoundTwoRegexRejectsNonJavaScriptSyntax(string pattern)
+    {
+        var schema = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject
+        {
+            ["value"] = new JsonObject { ["type"] = "string", ["pattern"] = pattern }
+        }};
+        Assert.ThrowsExactly<InvalidDataException>(() => new OutputSchema(schema));
+    }
+
+    [TestMethod]
+    [DataRow("^\\p{ASCII}+$", "abc", true)]
+    [DataRow("^\\p{ASCII}+$", "\u96ea", false)]
+    [DataRow("^(?<x>a)(b)\\1$", "aba", true)]
+    [DataRow("^(?<x>a)(b)\\1$", "abb", false)]
+    [DataRow("^(?<x>a)(b)\\k<x>$", "aba", true)]
+    public void RoundTwoRegexPropertiesAndCaptureNumbersMatchUpstream(string pattern, string value, bool expected)
+    {
+        var schema = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject
+        {
+            ["value"] = new JsonObject { ["type"] = "string", ["pattern"] = pattern }
+        }};
+        Assert.AreEqual(expected, new OutputSchema(schema).IsValid(new JsonObject { ["value"] = value }));
+    }
+
+    [TestMethod]
+    [DataRow("uri", "https://example.com/<bad>", false)]
+    [DataRow("uri", "https://example.com/%3Cgood%3E", true)]
+    [DataRow("uri-reference", "", true)]
+    [DataRow("uri-template", "https://example.com/%nothex", false)]
+    [DataRow("uri-template", "https://example.com/{value}", true)]
+    [DataRow("uuid", "123e4567-e89b-12d3-a456-426614174000\n", false)]
+    [DataRow("date", "2026-01-01\n", false)]
+    [DataRow("json-pointer-uri-fragment", "#not/a/pointer", false)]
+    [DataRow("json-pointer-uri-fragment", "#/valid~1pointer", true)]
+    [DataRow("regex", "(?i)abc", false)]
+    public void RoundTwoFormatsMatchUpstreamSyntaxAndBoundaries(string format, string value, bool expected)
+    {
+        var schema = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject
+        {
+            ["value"] = new JsonObject { ["type"] = "string", ["format"] = format }
+        }};
+        Assert.AreEqual(expected, new OutputSchema(schema).IsValid(new JsonObject { ["value"] = value }));
+    }
 }

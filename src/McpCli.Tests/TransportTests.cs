@@ -564,4 +564,62 @@ public sealed class TransportTests
         Assert.AreEqual(0, result.ExitCode, result.Stderr);
         StringAssert.Contains(result.Stdout, $"value ({expected}, optional)");
     }
+
+    [TestMethod]
+    [DataRow("stdio")]
+    [DataRow("http")]
+    public async Task RoundTwoNumericStringResponseIdsAreCorrelated(string transport)
+    {
+        await using var workspace = new TestWorkspace();
+        var server = transport == "http" ? await workspace.StartHttpAsync(new() { ["FAKE_STRING_IDS"] = "1" }) :
+            workspace.StdioConfig(new JsonObject { ["FAKE_STRING_IDS"] = "1" });
+        await workspace.WriteConfigAsync(("offline", server));
+        workspace.EnvironmentVariables["MCP_TIMEOUT"] = "1";
+        var result = await workspace.RunAsync(["call", "offline", "echo", "{}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        Assert.AreEqual("{}", result.Stdout.Trim());
+    }
+
+    [TestMethod]
+    public async Task RoundTwoLargeJsonRpcErrorCodesAreReportedWithoutTimingOut()
+    {
+        await using var workspace = new TestWorkspace();
+        await workspace.WriteConfigAsync(("offline", workspace.StdioConfig(new JsonObject { ["FAKE_ERROR_CODE"] = "4000000000" })));
+        workspace.EnvironmentVariables["MCP_TIMEOUT"] = "1";
+        var result = await workspace.RunAsync(["call", "offline", "fail", "{}"]);
+        Assert.AreEqual(2, result.ExitCode);
+        StringAssert.Contains(result.Stderr, "MCP error 4000000000");
+    }
+
+    [TestMethod]
+    public async Task RoundTwoMalformedSseEventDoesNotDiscardFollowingResponse()
+    {
+        await using var workspace = new TestWorkspace();
+        var server = await workspace.StartHttpAsync(new() { ["FAKE_HTTP_MODE"] = "malformed-event" });
+        await workspace.WriteConfigAsync(("http", server));
+        workspace.EnvironmentVariables["MCP_DEBUG"] = "1";
+        var result = await workspace.RunAsync(["call", "http", "echo", "{}"]);
+        Assert.AreEqual(0, result.ExitCode, result.Stderr);
+        Assert.AreEqual("{}", result.Stdout.Trim());
+        StringAssert.Contains(result.Stderr, "Ignoring malformed SSE message");
+    }
+
+    [TestMethod]
+    public async Task RoundTwoHttpGetStreamCarriesMultipleCachedResponses()
+    {
+        await using var workspace = new TestWorkspace();
+        var server = await workspace.StartHttpAsync(new() { ["FAKE_HTTP_MODE"] = "get-responses" });
+        await workspace.WriteConfigAsync(("http", server));
+        workspace.EnvironmentVariables["MCP_NO_DAEMON"] = "0";
+        workspace.EnvironmentVariables["MCP_TIMEOUT"] = "2";
+        workspace.TrackDaemon("http", server);
+        var info = await workspace.RunAsync(["info", "http"]);
+        Assert.AreEqual(0, info.ExitCode, info.Stderr);
+        foreach (var text in new[] { "first", "second" })
+        {
+            var result = await workspace.RunAsync(["call", "http", "echo"], new JsonObject { ["text"] = text }.ToJsonString());
+            Assert.AreEqual(0, result.ExitCode, result.Stderr);
+            Assert.AreEqual(text, result.Stdout.Trim());
+        }
+    }
 }

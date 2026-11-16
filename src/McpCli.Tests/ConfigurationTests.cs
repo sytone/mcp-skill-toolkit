@@ -144,4 +144,12 @@ public sealed class ConfigurationTests
         Assert.AreNotEqual(first.Hash(), changed.Hash());
         Assert.IsFalse(Daemon.PipeName("../../escape", first, new()).Contains("..", StringComparison.Ordinal));
     }
+
+    [TestMethod]
+    [DataRow("tool", "tool\n", false)]
+    [DataRow("**", "a\rb", false)]
+    [DataRow("**", "a\u2028b", false)]
+    [DataRow("*", "a\rb", true)]
+    public void RoundTwoSearchGlobsMatchJavaScriptLineBoundaries(string pattern, string value, bool expected) =>
+        Assert.AreEqual(expected, Glob.Compile(pattern).IsMatch(value));
 }

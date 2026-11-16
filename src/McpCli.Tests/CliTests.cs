@@ -114,4 +114,29 @@ public sealed class CliTests
         StringAssert.Contains(result.Stdout, "Description for echo");
         StringAssert.Contains(result.Stdout, "\u2022 text (string, required) - Text to echo");
     }
+
+    [TestMethod]
+    public async Task RoundTwoTestHarnessBoundsInputAndOutputAsWellAsProcessExit()
+    {
+        await using var workspace = new TestWorkspace();
+        await workspace.WriteConfigAsync(("offline", workspace.StdioConfig()));
+        workspace.EnvironmentVariables["MCP_TIMEOUT"] = "20";
+        using var timeout = new CancellationTokenSource(1000);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => workspace.RunAsync(
+            ["call", "offline", "slow", "{\"delay\":15000}"], cancellationToken: timeout.Token));
+        Assert.IsTrue(clock.Elapsed < TimeSpan.FromSeconds(5), "The harness must stop the owned process on cancellation.");
+    }
+
+    [TestMethod]
+    public async Task RoundTwoTestCleanupDoesNotTreatRecordedPidsAsOwnedProcesses()
+    {
+        var workspace = new TestWorkspace();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(workspace.Root, "server-pids.txt"), Environment.ProcessId.ToString());
+        }
+        finally { await workspace.DisposeAsync(); }
+        Assert.IsFalse(Directory.Exists(workspace.Root));
+    }
 }

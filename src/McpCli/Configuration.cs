@@ -215,12 +215,12 @@ public static class Glob
             {
                 var globstar = i + 1 < pattern.Length && pattern[i + 1] == '*';
                 while (i + 1 < pattern.Length && pattern[i + 1] == '*') i++;
-                expression.Append(!pathAware || globstar ? ".*" : "[^/]*");
+                expression.Append(!pathAware || globstar ? @"[^\r\n\u2028\u2029]*" : "[^/]*");
             }
-            else if (pattern[i] == '?') expression.Append(pathAware ? "[^/]" : ".");
+            else if (pattern[i] == '?') expression.Append(pathAware ? "[^/]" : @"[^\r\n\u2028\u2029]");
             else expression.Append(Regex.Escape(pattern[i].ToString()));
         }
-        expression.Append('$');
+        expression.Append(@"\z");
         return new(expression.ToString(), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant |
             RegexOptions.NonBacktracking);
     }

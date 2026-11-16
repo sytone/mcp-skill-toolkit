@@ -65,7 +65,7 @@ public sealed class HttpTransport(ServerConfig config, RuntimeSettings settings)
         var contentType = response.Content.Headers.ContentType?.MediaType;
         if (contentType == "text/event-stream")
         {
-            var expectedId = message["id"]!.ToJsonString();
+            var expectedId = RpcConnection.CorrelationId(message["id"]);
             var state = new EventState();
             try { await ReadEventsAsync(response, expectedId, state, cancellationToken); }
             catch (IOException error) when (state.LastId is not null)
@@ -199,12 +199,19 @@ public sealed class HttpTransport(ServerConfig config, RuntimeSettings settings)
                 if (data.Length != 0 && eventType is "" or "message")
                 {
                     var json = data.ToString().TrimEnd('\n');
-                    await DeliverAsync(json, cancellationToken);
-                    if (McpJson.Parse(json) is JsonObject obj && obj["id"] is not null &&
-                        !obj.ContainsKey("method") && (expectedId is null || obj["id"]!.ToJsonString() == expectedId))
+                    try
                     {
-                        state.ReceivedResponse = true;
-                        return;
+                        await DeliverAsync(json, cancellationToken);
+                        if (McpJson.Parse(json) is JsonObject obj && obj["id"] is not null &&
+                            !obj.ContainsKey("method") && (expectedId is null || RpcConnection.CorrelationId(obj["id"]) == expectedId))
+                        {
+                            state.ReceivedResponse = true;
+                            if (expectedId is not null) return;
+                        }
+                    }
+                    catch (Exception error) when (error is System.Text.Json.JsonException or InvalidDataException or FormatException)
+                    {
+                        settings.Debug($"Ignoring malformed SSE message: {error.Message}");
                     }
                 }
                 data.Clear();

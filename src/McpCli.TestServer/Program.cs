@@ -3,11 +3,15 @@ using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading.Channels;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 
 Console.InputEncoding = new UTF8Encoding(false);
 Console.OutputEncoding = new UTF8Encoding(false);
+using var lifetimeMarker = Environment.GetEnvironmentVariable("FAKE_PID_PATH") is { } markerBase ?
+    new FileStream($"{markerBase}.{Guid.NewGuid():N}.alive", FileMode.CreateNew, FileAccess.Write,
+        FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.DeleteOnClose) : null;
 if (Environment.GetEnvironmentVariable("FAKE_PID_PATH") is { } pidPath)
     await File.AppendAllTextAsync(pidPath, Environment.ProcessId + "\n");
 if (Environment.GetEnvironmentVariable("FAKE_STDERR") is { } diagnostic) Console.Error.WriteLine(diagnostic);
@@ -85,6 +89,22 @@ app.MapMethods("/mcp", ["GET", "POST", "DELETE"], async context =>
     }
     if (context.Request.Method == "GET")
     {
+        if (mode == "get-responses" && sessions.TryGetValue(context.Request.Headers["Mcp-Session-Id"].ToString(), out var activeSession))
+        {
+            context.Response.ContentType = "text/event-stream";
+            await context.Response.WriteAsync(": connected\n\n");
+            await context.Response.Body.FlushAsync();
+            try
+            {
+                await foreach (var message in activeSession.Responses.Reader.ReadAllAsync(context.RequestAborted))
+                {
+                    await context.Response.WriteAsync("data: " + FixtureJson.Serialize(message) + "\n\n");
+                    await context.Response.Body.FlushAsync();
+                }
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { }
+            return;
+        }
         if (resume.TryRemove(context.Request.Headers["Last-Event-ID"].ToString(), out var replay))
         {
             context.Response.ContentType = "text/event-stream";
@@ -122,6 +142,12 @@ app.MapMethods("/mcp", ["GET", "POST", "DELETE"], async context =>
     }
     var response = await session.HandleAsync(request);
     if (response is null) { context.Response.StatusCode = mode == "batch" ? 200 : 202; return; }
+    if (mode == "get-responses" && request["method"]?.ToString() != "initialize")
+    {
+        session.Responses.Writer.TryWrite(response);
+        context.Response.StatusCode = 202;
+        return;
+    }
     if (Environment.GetEnvironmentVariable("FAKE_HTTP_COMPRESSION") is { } compression)
     {
         context.Response.ContentType = mode == "sse" ? "text/event-stream" : "application/json";
@@ -148,9 +174,11 @@ app.MapMethods("/mcp", ["GET", "POST", "DELETE"], async context =>
         await context.Response.WriteAsync($"id: {eventId}\nretry: 10\n\n");
         return;
     }
-    if (mode == "sse")
+    if (mode is "sse" or "malformed-event")
     {
         context.Response.ContentType = "text/event-stream";
+        if (mode == "malformed-event")
+            await context.Response.WriteAsync("data: {not-json}\n\n");
         await context.Response.WriteAsync(": keep-alive\r\n\r\n");
         await context.Response.WriteAsync("event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\r\n\r\n");
         var text = "event: message\r\ndata: " + FixtureJson.Serialize(response) + "\r\n\r\n";
@@ -182,6 +210,7 @@ internal sealed class FakeSession
     public string Version { get; } = Environment.GetEnvironmentVariable("FAKE_PROTOCOL") ?? "2025-11-25";
     private static readonly SemaphoreSlim LogLock = new(1);
     private readonly ConcurrentDictionary<string, CancellationTokenSource> pending = new();
+    public Channel<JsonObject> Responses { get; } = Channel.CreateUnbounded<JsonObject>();
 
     public static async Task LogAsync(string path, JsonObject entry)
     {
@@ -254,6 +283,10 @@ internal sealed class FakeSession
                     if (calls == 1) return Error(request, "EPIPE while validating input");
                     result = Text("unexpected retry");
                     break;
+                case "transient_once":
+                    if (calls == 1) return Error(request, "HTTP 503 Service Unavailable");
+                    result = Text("retried");
+                    break;
                 case "cancellable":
                     var requestId = request["id"]!.ToJsonString();
                     using (var cancellation = new CancellationTokenSource())
@@ -315,13 +348,20 @@ internal sealed class FakeSession
     };
     private static JsonObject Result(JsonObject request, JsonNode result) => new()
     {
-        ["jsonrpc"] = "2.0", ["id"] = request["id"]!.DeepClone(), ["result"] = result
+        ["jsonrpc"] = "2.0", ["id"] = ResponseId(request), ["result"] = result
     };
     private static JsonObject Error(JsonObject request, string message) => new()
     {
-        ["jsonrpc"] = "2.0", ["id"] = request["id"]!.DeepClone(),
-        ["error"] = new JsonObject { ["code"] = -32602, ["message"] = message }
+        ["jsonrpc"] = "2.0", ["id"] = ResponseId(request),
+        ["error"] = new JsonObject
+        {
+            ["code"] = long.TryParse(Environment.GetEnvironmentVariable("FAKE_ERROR_CODE"), out var code) ? code : -32602,
+            ["message"] = message
+        }
     };
+    private static JsonNode ResponseId(JsonObject request) =>
+        Environment.GetEnvironmentVariable("FAKE_STRING_IDS") == "1" ?
+            JsonValue.Create(request["id"]!.ToString()) : request["id"]!.DeepClone();
 }
 
 internal static class FixtureJson

@@ -9,13 +9,28 @@ namespace McpCli;
 internal static class SchemaRegex
 {
     private readonly record struct Atom(Predicate<int> Matches, int? Literal = null);
+    private sealed record Captures(Dictionary<int, (int Number, int Length)> Positions, Dictionary<string, int> Names);
 
     public static Regex Compile(string pattern)
     {
+        var captures = ReadCaptures(pattern);
         var result = new StringBuilder();
         for (var i = 0; i < pattern.Length;)
         {
-            if (pattern[i] == '[')
+            if (captures.Positions.TryGetValue(i, out var capture))
+            {
+                result.Append("(?<").Append(capture.Number).Append('>');
+                i += capture.Length;
+            }
+            else if (pattern[i] == '\\' && i + 2 < pattern.Length && pattern[i + 1] == 'k' && pattern[i + 2] == '<')
+            {
+                var end = pattern.IndexOf('>', i + 3);
+                if (end < 0 || !captures.Names.TryGetValue(Identifier(pattern[(i + 3)..end]), out var number))
+                    throw new InvalidDataException("Invalid output schema named backreference");
+                result.Append(@"\k<").Append(number).Append('>');
+                i = end + 1;
+            }
+            else if (pattern[i] == '[')
             {
                 i++;
                 var negate = i < pattern.Length && pattern[i] == '^';
@@ -55,7 +70,22 @@ internal static class SchemaRegex
             }
             else if (pattern[i] == '\\' && i + 1 < pattern.Length)
             {
-                result.Append(pattern[i++]).Append(pattern[i++]);
+                var escape = pattern[i + 1];
+                if (escape is 'b' or 'B')
+                    result.Append(pattern[i++]).Append(pattern[i++]);
+                else if (escape is >= '1' and <= '9')
+                {
+                    var start = ++i;
+                    while (i < pattern.Length && char.IsAsciiDigit(pattern[i])) i++;
+                    if (!int.TryParse(pattern[start..i], out var number) || number > captures.Positions.Count)
+                        throw new InvalidDataException("Invalid output schema numeric backreference");
+                    result.Append(@"\k<").Append(number).Append('>');
+                }
+                else
+                {
+                    var atom = ReadAtom(pattern, ref i);
+                    result.Append(ScalarSet(atom.Matches));
+                }
             }
             else if (char.IsSurrogate(pattern[i]))
             {
@@ -115,7 +145,11 @@ internal static class SchemaRegex
                         throw new InvalidDataException("Invalid output schema control escape");
                     value = char.ToUpperInvariant(pattern[position++]) % 32;
                     break;
-                default: value = escape; break;
+                default:
+                    if (!@"^$\.*+?()[]{}|/-".Contains(escape))
+                        throw new InvalidDataException($"Invalid output schema pattern escape: \\{escape}");
+                    value = escape;
+                    break;
             }
         }
         if (value is >= 0xD800 and <= 0xDBFF && position < pattern.Length)
@@ -151,6 +185,11 @@ internal static class SchemaRegex
 
     private static Predicate<int> Category(string name)
     {
+        if (name == "ASCII") return point => point <= 0x7F;
+        if (name == "Any") return _ => true;
+        if (name == "ASCII_Hex_Digit") return point => point is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F';
+        if (name == "Assigned") return point => point is >= 0xD800 and <= 0xDFFF ||
+            Rune.GetUnicodeCategory(new Rune(point)) != UnicodeCategory.OtherNotAssigned;
         if (name.StartsWith("General_Category=", StringComparison.Ordinal)) name = name["General_Category=".Length..];
         else if (name.StartsWith("gc=", StringComparison.Ordinal)) name = name[3..];
         UnicodeCategory[] categories = name switch
@@ -242,5 +281,61 @@ internal static class SchemaRegex
             if (point != start) ranges.Append(@"-\u").Append(point.ToString("X4", CultureInfo.InvariantCulture));
         }
         return ranges.Length == 0 ? "" : "[" + ranges + "]";
+    }
+
+    internal static void ValidateGroupSyntax(string pattern) => ReadCaptures(pattern);
+
+    private static Captures ReadCaptures(string pattern)
+    {
+        var positions = new Dictionary<int, (int Number, int Length)>();
+        var names = new Dictionary<string, int>(StringComparer.Ordinal);
+        var inClass = false;
+        for (var i = 0; i < pattern.Length; i++)
+        {
+            if (pattern[i] == '\\') { i++; continue; }
+            if (pattern[i] == '[' && !inClass) { inClass = true; continue; }
+            if (pattern[i] == ']' && inClass) { inClass = false; continue; }
+            if (inClass || pattern[i] != '(') continue;
+            if (i + 1 >= pattern.Length || pattern[i + 1] != '?')
+            {
+                positions.Add(i, (positions.Count + 1, 1));
+                continue;
+            }
+            if (i + 2 < pattern.Length && pattern[i + 2] is ':' or '=' or '!') continue;
+            if (i + 3 < pattern.Length && pattern[i + 2] == '<')
+            {
+                if (pattern[i + 3] is '=' or '!') continue;
+                var end = pattern.IndexOf('>', i + 3);
+                if (end < 0) throw new InvalidDataException("Invalid output schema capture name");
+                var name = Identifier(pattern[(i + 3)..end]);
+                var number = positions.Count + 1;
+                if (!names.TryAdd(name, number)) throw new InvalidDataException("Duplicate output schema capture name");
+                positions.Add(i, (number, end - i + 1));
+                i = end;
+                continue;
+            }
+            throw new InvalidDataException("Invalid JavaScript group syntax in output schema pattern");
+        }
+        return new(positions, names);
+    }
+
+    private static string Identifier(string text)
+    {
+        var result = new StringBuilder();
+        for (var i = 0; i < text.Length;)
+        {
+            var atom = ReadAtom(text, ref i);
+            if (atom.Literal is not { } point || !Rune.IsValid(point))
+                throw new InvalidDataException("Invalid output schema capture name");
+            var rune = new Rune(point);
+            var category = Rune.GetUnicodeCategory(rune);
+            var valid = Rune.IsLetter(rune) || category == UnicodeCategory.LetterNumber || point is '$' or '_' or 0x2118 or 0x212E or 0x309B or 0x309C;
+            if (result.Length > 0) valid |= category is UnicodeCategory.NonSpacingMark or UnicodeCategory.SpacingCombiningMark or
+                UnicodeCategory.DecimalDigitNumber or UnicodeCategory.ConnectorPunctuation ||
+                point is 0x200C or 0x200D or 0xB7 or 0x387 or >= 0x1369 and <= 0x1371 or 0x19DA;
+            if (!valid) throw new InvalidDataException("Invalid output schema capture name");
+            result.Append(rune.ToString());
+        }
+        return result.Length > 0 ? result.ToString() : throw new InvalidDataException("Invalid output schema capture name");
     }
 }

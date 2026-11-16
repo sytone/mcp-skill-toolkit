@@ -4,6 +4,8 @@ using System.Text.RegularExpressions;
 
 namespace McpCli;
 
+public readonly record struct RetryOptions(int TimeoutMs, int MaxRetries, int BaseDelayMs);
+
 public static class Retry
 {
     public static bool IsTransient(Exception error)
@@ -23,10 +25,14 @@ public static class Retry
     }
 
     public static async Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> action, string operation,
-        RuntimeSettings settings, CancellationToken cancellationToken)
+        RuntimeSettings settings, CancellationToken cancellationToken, RetryOptions? options = null)
     {
+        var policy = options ?? new RetryOptions(settings.TimeoutMs, settings.MaxRetries, settings.RetryDelayMs);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(policy.TimeoutMs);
+        ArgumentOutOfRangeException.ThrowIfNegative(policy.MaxRetries);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(policy.BaseDelayMs);
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        budget.CancelAfter(settings.TimeoutMs);
+        budget.CancelAfter(policy.TimeoutMs);
         var clock = Stopwatch.StartNew();
         for (var attempt = 0; ; attempt++)
         {
@@ -39,14 +45,14 @@ public static class Retry
                 throw new TimeoutException($"{operation}: timeout budget exhausted after {clock.ElapsedMilliseconds}ms");
             }
             catch (Exception error) when (error is not OperationCanceledException &&
-                attempt < settings.MaxRetries && IsTransient(error) &&
-                settings.TimeoutMs - clock.ElapsedMilliseconds > 1000)
+                attempt < policy.MaxRetries && IsTransient(error) &&
+                policy.TimeoutMs - clock.ElapsedMilliseconds > 1000)
             {
-                var maximum = Math.Min(10000, Math.Max(0, settings.TimeoutMs - 5000) / 2.0);
-                var delay = Math.Min(settings.RetryDelayMs * Math.Pow(2, attempt), maximum);
+                var maximum = Math.Min(10000, Math.Max(0, policy.TimeoutMs - 5000) / 2.0);
+                var delay = Math.Min(policy.BaseDelayMs * Math.Pow(2, attempt), maximum);
                 delay = Math.Round(delay * (0.75 + Random.Shared.NextDouble() * 0.5));
-                delay = Math.Max(0, Math.Min(delay, settings.TimeoutMs - clock.ElapsedMilliseconds - 1000));
-                settings.Debug($"{operation} failed (attempt {attempt + 1}/{settings.MaxRetries + 1}): " +
+                delay = Math.Max(0, Math.Min(delay, policy.TimeoutMs - clock.ElapsedMilliseconds - 1000));
+                settings.Debug($"{operation} failed (attempt {attempt + 1}/{policy.MaxRetries + 1}): " +
                     $"{error.Message}. Retrying in {delay}ms...");
                 try
                 {

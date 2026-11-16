@@ -68,16 +68,31 @@ public sealed class TestWorkspace : IAsyncDisposable
         return process;
     }
 
-    public async Task<CliResult> RunAsync(string[] arguments, string? stdin = null, bool withConfig = true)
+    public async Task<CliResult> RunAsync(string[] arguments, string? stdin = null, bool withConfig = true,
+        CancellationToken cancellationToken = default)
     {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(30000);
         var process = StartCli(arguments, withConfig);
-        var stdout = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEndAsync();
-        if (stdin is not null) await process.StandardInput.WriteAsync(stdin);
-        process.StandardInput.Close();
-        using var timeout = new CancellationTokenSource(30000);
-        await process.WaitForExitAsync(timeout.Token);
-        return new(process.ExitCode, await stdout, await stderr);
+        var stdout = process.StandardOutput.ReadToEndAsync(timeout.Token);
+        var stderr = process.StandardError.ReadToEndAsync(timeout.Token);
+        try
+        {
+            if (stdin is not null)
+                await process.StandardInput.WriteAsync(stdin.AsMemory(), timeout.Token).WaitAsync(timeout.Token);
+            process.StandardInput.Close();
+            await Task.WhenAll(process.WaitForExitAsync(timeout.Token), stdout, stderr).WaitAsync(timeout.Token);
+            return new(process.ExitCode, await stdout, await stderr);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync(CancellationToken.None);
+            }
+            throw;
+        }
     }
 
     public void TrackDaemon(string name, ServerConfig server) => daemons.Add((name, server));
@@ -104,6 +119,8 @@ public sealed class TestWorkspace : IAsyncDisposable
             RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
             StandardInputEncoding = new UTF8Encoding(false), StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
         };
+        foreach (var name in start.Environment.Keys.Where(n => n.StartsWith("FAKE_", StringComparison.Ordinal)).ToArray())
+            start.Environment.Remove(name);
         if (assemblyFile) start.ArgumentList.Add(assembly);
         return start;
     }
@@ -136,18 +153,12 @@ public sealed class TestWorkspace : IAsyncDisposable
             }
             process.Dispose();
         }
-        var pidPath = Path.Combine(Root, "server-pids.txt");
-        if (File.Exists(pidPath))
+        // Instance-specific delete-on-close markers cannot accidentally refer to a recycled PID.
+        using (var timeout = new CancellationTokenSource(5000))
         {
-            foreach (var line in await File.ReadAllLinesAsync(pidPath))
+            while (Directory.EnumerateFiles(Root, "server-pids.txt.*.alive").Any())
             {
-                try
-                {
-                    using var process = Process.GetProcessById(int.Parse(line));
-                    using var timeout = new CancellationTokenSource(5000);
-                    await process.WaitForExitAsync(timeout.Token);
-                }
-                catch (ArgumentException) { /* Fixture already exited. */ }
+                await Task.Delay(50, timeout.Token);
             }
         }
         for (var attempt = 0; ; attempt++)

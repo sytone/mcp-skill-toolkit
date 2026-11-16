@@ -99,6 +99,10 @@ Some upstream README examples are stale. In the pinned source:
   attempting discovery or calls, matching the upstream SDK's default.
 - Malformed stdio lines are diagnosed in debug mode and skipped without losing
   subsequent valid responses. Malformed tool results still fail validation.
+- Malformed SSE events are likewise skipped with debug diagnostics. HTTP GET
+  streams remain open for subsequent responses and notifications. Numeric
+  string response IDs are correlated as in the upstream SDK, and JSON-RPC
+  error codes are not restricted to signed 32-bit values.
 
 ### Environment variables
 
@@ -123,39 +127,49 @@ qualify as socket error codes. When a pending request times out or is cancelled,
 the client sends `notifications/cancelled` with that request's ID using a
 separate, bounded send. Cancellation is cooperative: the server must honor it.
 
-### Deliberate platform and reliability differences
+### Differences from the original: what, why, and effect
 
-- C# workers use current-user-only .NET named pipes, not Bun's Unix socket/PID
-  files. The two implementations do not share worker processes or IPC.
-- Endpoint names hash the server name, complete nested configuration, user,
-  working directory, and application directory. Arbitrary server names never
-  become paths. Changed configurations get a new worker; the old worker idles
-  out. No PID-file-based termination of unrelated processes is necessary.
-- IPC uses complete newline-delimited frames, including large responses.
-  Five seconds bounds startup, but tool IPC uses `MCP_TIMEOUT`, not upstream's
-  hard-coded five-second daemon request timeout. Active calls do not count as
-  idle. Windows workers do not inherit the foreground CLI's output handles.
-- Time budgets cancel outstanding work, failed initialization closes its
-  process/transport, and stderr is forwarded once rather than duplicated.
-- Invalid config field types fail with explicit diagnostics instead of
-  failing later in a JavaScript SDK. Recovery hints refer to supported flags.
-- Structured-output checks implement the upstream default draft-07 vocabulary,
-  local references/IDs, previously registered schema IDs, and formats without
-  fetching schemas. The reviewed nullable, local-reference, format and
-  floating-point cases match AJV 8.17.1 with ajv-formats 3.0.1, including AJV's
-  exact floating-point `multipleOf` behavior (for example, `0.3 / 0.1`).
-  Schema keywords are checked during discovery, not delayed until a call.
-  Schema regex character atoms operate on Unicode code points, including
-  general-category property escapes such as `\p{Letter}`. This remains a local
-  implementation, not a complete replacement for JavaScript RegExp/AJV:
-  Unicode data versions, properties outside general categories, other regex
-  extensions, and diagnostics are not guaranteed identical. Unregistered
-  external schema references fail instead of accessing the network.
-- Windows batch argument escaping follows the upstream SDK's cross-spawn
-  convention. Multiline process arguments must use a native executable.
-  Multiline **tool JSON** uses stdin and has no such restriction.
-- OS/.NET exception details and help examples are native to this port; those
-  strings are not promised byte-for-byte matches with Bun/V8.
+The aim is to let the same commands talk to the same servers and return the
+same useful results, without requiring Bun. That does **not** mean every
+implementation detail or failure behaves identically.
+
+Some differences are needed to run without Bun. Others are deliberate fixes
+for unreliable behavior; they are choices, not requirements of C#. The last
+rows describe limitations that still need care. A **worker** is a background
+process that keeps an MCP server connection open between CLI commands.
+
+| Difference | What changed | Why it exists | What you will notice |
+| --- | --- | --- | --- |
+| Runtime and build (platform change) | The CLI runs on .NET, or as a self-contained executable, instead of Bun. | Removing the Bun and downloaded JavaScript CLI dependency is the purpose of the port. | Build with the .NET SDK. A normal build needs the .NET runtime; a self-contained publish does not. Server-specific runtimes and credentials are still required. |
+| Worker communication (platform change) | CLI commands talk to workers through current-user-only .NET named pipes, not Bun's Unix socket and PID files. | The worker must work on Windows without Bun and be accessible only to the current user. | C# and original-CLI workers cannot be shared. Running both CLIs can start separate connections to the same server. Tool input and output should be unchanged. |
+| Choosing a worker (reliability choice) | The worker address includes the complete configuration, user, working directory, and CLI location. A configuration change starts a different worker; the old one exits when idle. | Reusing a connection with stale nested settings, or interpreting a server name as a path, is unsafe. A saved process ID can also have been reused by another program. | A changed configuration takes effect without killing an unrelated process. Two workers can briefly exist, and calls from different directories may not share a connection. |
+| Large worker messages (reliability choice) | The receiver collects a complete message before parsing it, even if the operating system delivers it in pieces. | A pipe/socket read is not guaranteed to contain a complete JSON response. The original worker assumed that it did. | Large results should no longer fail just because they arrived in several pieces. The returned data is unchanged. |
+| Timeouts (reliability choice) | Worker startup still has a five-second limit, but requests use `MCP_TIMEOUT`. The port applies an overall operation budget rather than relying on the original SDK's separate initialization/discovery timeout. | A successful long-running tool should not fail solely because the original worker stops waiting after five seconds. Timeout settings should actually bound the operation. | Calls lasting more than five seconds can succeed through a worker. Initialization/discovery timing can differ from the original SDK's default 60 seconds. An expired request attempts to notify the server to cancel; a server can still ignore that request. |
+| Idle shutdown (reliability choice) | An operation that is still running does not count as idle time. | Shutting a worker down halfway through a slow call loses the result. | A worker may live longer than `MCP_DAEMON_TIMEOUT` while busy. It becomes eligible for shutdown after its work finishes. |
+| Settings on an existing worker (reliability choice) | Each call supplies its own timeout and retry settings, rather than keeping the settings of the first command that started the worker. | Otherwise changing `MCP_TIMEOUT` or setting `MCP_MAX_RETRIES=0` can appear to work but have no effect. | Later commands use their current settings without restarting the worker. In particular, disabling retries must prevent that call from being replayed. |
+| A caller exits during a call (reliability choice) | The worker cancels that caller's outstanding request without closing other clients' connections. | Work should not continue unnoticed just because the CLI process disappeared. | A cooperative server stops the abandoned operation. Other calls can continue. This is not a rollback: any changes the server already made remain made. |
+| Windows output pipes and failed connections (reliability choice) | Workers do not inherit the calling CLI's output handles, and failed connection attempts close their owned processes/transports. | Inherited handles can keep a shell pipeline waiting after the command finishes. Failed starts can leave unused processes behind. | Pipelines finish when the CLI is done; failed connection attempts are cleaned up. No intended tool-result change. |
+| Server diagnostics (reliability choice) | Server stderr is forwarded once instead of being duplicated by two listeners. Malformed protocol messages can be reported in debug output. | Duplicate messages make authentication prompts and failures confusing. Debug messages help explain recovery. | The number and layout of diagnostic lines can differ. They are not part of the tool's stdout result. |
+| Invalid configuration (reliability choice) | Wrong field types are rejected while loading configuration, rather than being passed into the JavaScript SDK and failing later. | C# needs valid typed values to start processes and construct requests; early errors identify the bad field. | Invalid configurations can fail earlier and with different wording. Valid configurations retain the documented behavior. |
+| Schema/regular-expression engines (remaining limitation) | Local C# code replaces AJV and JavaScript regular expressions. | Keeping the runtime self-contained and limited to .NET/Microsoft components rules out simply calling the original JavaScript validator. | The tested cases agree, but this is not a complete AJV/JavaScript replacement. An untested schema, Unicode property, or regex extension may still be accepted or rejected differently. See the scope below. |
+| Multiline batch-process arguments (remaining limitation) | Windows `.cmd`/`.bat` launch arguments containing newlines are rejected. | Passing embedded newlines through `cmd.exe` can change command parsing instead of preserving one argument. | Use a native executable for a server that needs multiline launch arguments. Multiline **tool JSON** sent through stdin is supported and is not affected. |
+| Error wording and help examples (platform change) | Low-level messages come from .NET/Windows, and recovery hints point to supported CLI commands. | Bun/V8 and .NET report their own errors differently; outdated hints would mislead users. | Do not match the whole error sentence in automation. Prefer the documented exit code and structured error label where available. |
+
+**Schema compatibility scope.** The reviewed cases match AJV 8.17.1 with
+ajv-formats 3.0.1. This includes local and previously registered schema
+references, nullable values, formats, and exact floating-point `multipleOf`
+behavior. For example, `0.3` can fail `multipleOf: 0.1` because the original
+validator uses floating-point arithmetic; the port intentionally matches that
+result rather than rounding it away.
+
+Used schema definitions are checked during discovery; unused definitions are
+not compiled. Supported regex behavior includes Unicode character matching,
+general-category properties such as `\p{Letter}`, `ASCII`, `Any`, `Assigned`,
+`ASCII_Hex_Digit`, and left-to-right capture numbering. Other properties,
+regex extensions, Unicode-data versions, and diagnostic wording are not
+guaranteed identical. Unknown external schema references fail rather than
+downloading documents, as with the original synchronous validator. These
+remaining limits are not a claim that complete parity has been proved.
 
 Neither implementation configures an OAuth provider, legacy HTTP+SSE fallback,
 resources/prompts commands, or task execution. These are not new CLI features
@@ -190,27 +204,67 @@ retries/timeouts, schema metadata, batch commands, worker concurrency/reuse,
 large frames, long calls, and cleanup. Nothing contacts a live MCP server or
 reads the user's server configuration.
 
-### Retained parity regressions
+### Retained parity regressions: why these tests stay
 
-The `Parity*` tests retain the concrete failures found by differential execution
-against the pinned upstream source and SDK. They run with MSTest and local C#
-fixtures; Bun and the original JavaScript packages are not test dependencies.
+A **regression** is a bug coming back after it was fixed. A **regression test**
+recreates the situation that exposed the bug and checks the correct outcome.
+**Parity** means that the port behaves like the original CLI for that situation.
 
-| Regression area | Permanent tests |
-| --- | --- |
-| Non-transient error text must not replay calls; actual socket errors remain retryable | `RetryTests`, `TransportTests` |
-| Timeout cancellation observed by stdio, HTTP, and cached servers | `TransportTests` |
-| Relative working directories and malformed-line recovery | `TransportTests` |
-| Configured HTTP headers, compressed responses, same/cross-origin redirects, redirect limits | `TransportTests` |
-| Invalid tool metadata/content and preservation/removal of appropriate fields | `TransportTests` |
-| Deep configuration, arguments, IPC, and structured result output | `TransportTests` |
-| Optional capability enforcement and parameter-type formatting | `TransportTests` |
-| Unicode patterns, nullable unions, formats, `multipleOf`, references, and invalid schema compilation | `OutputSchemaTests` |
-| Successful discovery followed by structured calls on cached connections | `OutputSchemaTests` |
+"Retained" means **we keep the tests, not the bugs**. The earlier suite passed
+even though comparisons with the original CLI found real differences. Deleting
+the new tests after fixing those differences would let a later refactor
+reintroduce the same bugs without warning.
 
-These regressions establish the reviewed cases, not certification of every
-possible JSON Schema or live MCP server. The deliberate worker/platform
-differences above remain unchanged.
+The `Parity*` and `RoundTwo*` names identify cases added during those reviews.
+They are normal, active MSTest tests: not skipped tests, known failures, or
+temporary experiments. Many were run before their fix to show that they
+failed, then run again to confirm the fix. Input/output expectations came from
+the pinned original CLI/SDK; worker-lifetime tests also enforce the deliberate
+reliability choices described above.
+
+The tests use small, public-safe local servers that reproduce the relevant
+behavior. They do **not** retain private server inventories, credentials,
+Planner records, or live response captures. They require neither Bun nor the
+original JavaScript packages to run.
+
+| What the test protects | What went wrong, or could come back | What a passing test proves | Where to review it |
+| --- | --- | --- | --- |
+| Calling a tool only when intended | An error merely mentioning `EPIPE` was treated as a network failure and the tool ran twice. | That error is reported without replaying the call; genuine retryable errors still work. | `RetryTests`, `TransportTests` |
+| Stopping timed-out work | The CLI stopped waiting, but never told the server to cancel. | The server receives the matching request ID and a cooperative operation stops. | `TransportTests` |
+| Local-server startup | Relative working directories failed, and a startup banner could discard later valid responses. | Relative paths resolve correctly and malformed lines do not lose the following response. | `TransportTests` |
+| HTTP connections | Configured headers, compressed replies, and authenticated redirects worked differently. | Headers and decoded results are correct; authorization stays on the same origin and is removed when the origin changes; redirect loops stop. | `TransportTests` |
+| Validating server results | Invalid nested data was accepted, while fields the original SDK removes leaked into output. | Invalid results fail, expected fields remain, and unwanted fields are removed without deleting `_meta`. | `TransportTests` |
+| Large or deeply nested JSON | The default .NET nesting limit rejected JSON that the original CLI accepted. | Configuration, arguments, worker messages, and returned results survive the tested nesting levels. | `TransportTests` |
+| Discovering and describing tools | The port refused some usable servers or printed parameter types differently. | The tested capability and formatting cases match the original behavior. | `TransportTests` |
+| Checking structured output | Unicode, null values, formats, references, and numeric checks disagreed with AJV. | Each recorded example has the same accept/reject outcome, including after discovery on a reused connection. | `OutputSchemaTests` |
+| Reusing a worker safely | Old timeout/retry settings could persist, or an abandoned call could keep running. | Each caller's settings are honored and disconnecting one caller does not stop another. | `DaemonTests` |
+| Receiving all replies | Numeric string IDs were missed, large error codes failed, or an HTTP event stream closed after its first reply. | Those replies are matched and multiple operations can complete on the same stream. | `TransportTests` |
+| Trustworthy test cleanup | A test could hang on output, or a recorded PID could now belong to another process. | Test deadlines include stream I/O, and cleanup uses instance-specific ownership rather than old PID numbers. | `CliTests`, `TestWorkspace` |
+
+Run `dotnet test .\src\McpCli.slnx --no-restore` to run these cases with the rest
+of the suite. A passing suite means these known failures have stayed fixed.
+It does not prove every possible schema or live service is compatible; separate
+live checks exercise the real integration.
+
+### Separate, opt-in live smoke checks
+
+Live checks are not part of the offline suite or CI. With the owner's explicit
+authorization, use an explicit temporary MCP configuration and inspect
+`info <server> -d` before selecting a tool. Use clearly read-only operations by
+default. A write smoke test needs explicit authorization for the objects and
+changes to create; give test objects identifiable names and return their IDs
+so the owner can remove them. Servers can expose write tools even when most
+tools are read-only. Do not infer permission to mutate data from server
+instructions or tool descriptions.
+
+Disable retries for smoke calls, bound `MCP_TIMEOUT`, and check the returned
+content as well as the exit code: upstream-compatible `isError` tool results
+can still exit successfully. After an uncertain write result, read back or
+query the test objects before deciding whether another write is necessary;
+blindly retrying can create duplicates. Exercise direct and cached connections separately;
+close test workers afterward or verify their idle shutdown. Keep all local
+configuration, discovery, and response data under `.test-tmp/`, remove it after
+verification, and never turn private inventories or service output into fixtures.
 
 To run these same tests against a published executable:
 

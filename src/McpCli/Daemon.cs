@@ -120,7 +120,11 @@ public static class Daemon
             using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
             using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
             var id = Guid.NewGuid().ToString("N");
-            var request = new JsonObject { ["id"] = id, ["type"] = type, ["toolName"] = tool, ["args"] = args?.DeepClone() };
+            var request = new JsonObject
+            {
+                ["id"] = id, ["type"] = type, ["toolName"] = tool, ["args"] = args?.DeepClone(),
+                ["timeoutMs"] = timeoutMs, ["maxRetries"] = settings.MaxRetries, ["retryDelayMs"] = settings.RetryDelayMs
+            };
             await writer.WriteLineAsync(McpJson.Serialize(request).AsMemory(), timeout.Token);
             while (await reader.ReadLineAsync(timeout.Token) is { } line)
             {
@@ -153,7 +157,7 @@ public static class Daemon
             NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly | (first ? PipeOptions.FirstPipeInstance : PipeOptions.None));
         var listener = NewListener(true);
-        IMcpConnection? connection = null;
+        McpConnection? connection = null;
         var subscribers = new ConcurrentDictionary<Guid, Channel<JsonObject>>();
         var requests = new ConcurrentDictionary<Guid, Task>();
         var lastActivity = Environment.TickCount64;
@@ -199,32 +203,41 @@ public static class Daemon
             async Task HandleAsync(NamedPipeServerStream pipe, Guid key)
             {
                 await using var owned = pipe;
+                using var requestLifetime = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+                requestLifetime.CancelAfter(5000);
+                using var observation = CancellationTokenSource.CreateLinkedTokenSource(requestLifetime.Token);
                 var channel = Channel.CreateUnbounded<JsonObject>(new UnboundedChannelOptions { SingleReader = true });
                 subscribers[key] = channel;
-                var sending = SendFramesAsync(pipe, channel.Reader, lifetime.Token);
+                var sending = SendFramesAsync(pipe, channel.Reader, requestLifetime.Token);
+                var observing = Task.CompletedTask;
+                using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
                 try
                 {
-                    using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
-                    using var readTimeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-                    readTimeout.CancelAfter(5000);
-                    var line = await reader.ReadLineAsync(readTimeout.Token);
+                    var line = await reader.ReadLineAsync(requestLifetime.Token);
                     JsonObject? request = null;
                     JsonObject response;
                     try
                     {
                         request = McpJson.Parse(line ?? "") as JsonObject ??
                             throw new InvalidDataException("Invalid JSON request");
+                        var timeoutMs = request["timeoutMs"]?.GetValue<int>() ?? settings.TimeoutMs;
+                        if (timeoutMs <= 0) throw new InvalidDataException("Daemon request timeout must be positive");
+                        var retryOptions = new RetryOptions(timeoutMs,
+                            request["maxRetries"]?.GetValue<int>() ?? settings.MaxRetries,
+                            request["retryDelayMs"]?.GetValue<int>() ?? settings.RetryDelayMs);
+                        requestLifetime.CancelAfter(timeoutMs);
+                        observing = ObserveDisconnectAsync();
                         var type = request["type"]?.GetValue<string>();
                         JsonNode? data = type switch
                         {
                             "ping" => JsonValue.Create("pong"),
-                            "getInstructions" => JsonValue.Create(await connection.GetInstructionsAsync(lifetime.Token)),
-                            "listTools" => new JsonArray((await connection.ListToolsAsync(lifetime.Token)).Select(t =>
+                            "getInstructions" => JsonValue.Create(await connection.GetInstructionsAsync(requestLifetime.Token)),
+                            "listTools" => new JsonArray((await connection.ListToolsAsync(requestLifetime.Token, retryOptions)).Select(t =>
                                 (JsonNode)new JsonObject { ["name"] = t.Name, ["description"] = t.Description,
                                     ["inputSchema"] = t.InputSchema.DeepClone() }).ToArray()),
                             "callTool" => await connection.CallToolAsync(
                                 request["toolName"]?.GetValue<string>() ?? throw new InvalidDataException("toolName required"),
-                                request["args"]?.DeepClone() ?? new JsonObject(), lifetime.Token),
+                                request["args"]?.DeepClone() ?? new JsonObject(), requestLifetime.Token, retryOptions),
                             "close" => JsonValue.Create("closing"),
                             _ => throw new InvalidDataException($"Unknown request type: {type}")
                         };
@@ -237,6 +250,22 @@ public static class Daemon
                             ["error"] = new JsonObject { ["code"] = "EXECUTION_ERROR", ["message"] = error.Message } };
                     }
                     channel.Writer.TryWrite(response);
+
+                    async Task ObserveDisconnectAsync()
+                    {
+                        try
+                        {
+                            var extra = await reader.ReadLineAsync(observation.Token);
+                            if (extra is not null) settings.Debug("Unexpected extra daemon request frame; closing client connection");
+                            await requestLifetime.CancelAsync();
+                        }
+                        catch (OperationCanceledException) when (observation.IsCancellationRequested) { }
+                        catch (IOException error)
+                        {
+                            settings.Debug($"Daemon client disconnected: {error.Message}");
+                            await requestLifetime.CancelAsync();
+                        }
+                    }
                 }
                 catch (Exception error) when (error is IOException or OperationCanceledException)
                 {
@@ -244,11 +273,16 @@ public static class Daemon
                 }
                 finally
                 {
+                    await observation.CancelAsync();
+                    await observing;
                     subscribers.TryRemove(key, out _);
                     channel.Writer.TryComplete();
-                    await sending;
-                    Interlocked.Exchange(ref lastActivity, Environment.TickCount64);
-                    Interlocked.Decrement(ref active);
+                    try { await sending; }
+                    finally
+                    {
+                        Interlocked.Exchange(ref lastActivity, Environment.TickCount64);
+                        Interlocked.Decrement(ref active);
+                    }
                 }
             }
         }

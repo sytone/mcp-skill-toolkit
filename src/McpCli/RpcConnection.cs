@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -17,7 +18,8 @@ public abstract class RpcTransport : IAsyncDisposable
     protected async Task DeliverAsync(string json, CancellationToken cancellationToken)
     {
         var message = McpJson.Parse(json);
-        if (message is not JsonObject obj || obj["jsonrpc"]?.ToString() != "2.0")
+        if (message is not JsonObject obj || obj["jsonrpc"]?.GetValueKind() != JsonValueKind.String ||
+            obj["jsonrpc"]!.GetValue<string>() != "2.0")
             throw new InvalidDataException("Invalid JSON-RPC message from server");
         await ReceiveAsync(obj, cancellationToken);
     }
@@ -123,15 +125,35 @@ public sealed class RpcConnection : IAsyncDisposable
             }
             return;
         }
-        if (message["id"] is not { } id || !pending.TryGetValue(id.ToJsonString(), out var completion))
+        if (CorrelationId(message["id"]) is not { } key || !pending.TryGetValue(key, out var completion))
             return;
         if (message["error"] is JsonObject error)
         {
-            completion.TrySetException(new McpException(error["code"]?.GetValue<int>() ?? -32603,
-                error["message"]?.GetValue<string>() ?? "Unknown MCP error", error["data"]?.DeepClone()));
+            if (error["code"]?.GetValueKind() != JsonValueKind.Number ||
+                !error["code"]!.AsValue().TryGetValue<double>(out var code) ||
+                !double.IsFinite(code) || code != Math.Truncate(code) || Math.Abs(code) > 9007199254740991 ||
+                error["message"]?.GetValueKind() != JsonValueKind.String)
+                throw new InvalidDataException("Invalid JSON-RPC error response");
+            completion.TrySetException(new McpException((long)code,
+                error["message"]!.GetValue<string>(), error["data"]?.DeepClone()));
         }
         else if (message.ContainsKey("result")) completion.TrySetResult(message["result"]?.DeepClone());
         else completion.TrySetException(new InvalidDataException("Invalid JSON-RPC response: no result or error"));
+    }
+
+    internal static string? CorrelationId(JsonNode? id)
+    {
+        double number;
+        if (id?.GetValueKind() == JsonValueKind.Number)
+        {
+            if (!id.AsValue().TryGetValue<double>(out number)) return null;
+        }
+        else if (id?.GetValueKind() == JsonValueKind.String)
+        {
+            if (!double.TryParse(id.GetValue<string>(), NumberStyles.Float, CultureInfo.InvariantCulture, out number)) return null;
+        }
+        else return null;
+        return double.IsFinite(number) ? number.ToString("R", CultureInfo.InvariantCulture) : null;
     }
 
     private void Fail(Exception error)
@@ -147,9 +169,9 @@ public sealed class RpcConnection : IAsyncDisposable
     }
 }
 
-public sealed class McpException(int code, string message, JsonNode? data = null)
+public sealed class McpException(long code, string message, JsonNode? data = null)
     : Exception($"MCP error {code}: {message}")
 {
-    public int Code { get; } = code;
+    public long Code { get; } = code;
     public JsonNode? DataValue { get; } = data;
 }

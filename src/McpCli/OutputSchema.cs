@@ -14,7 +14,7 @@ public sealed class OutputSchema
     private readonly Dictionary<string, JsonNode> references = new(StringComparer.Ordinal);
     private readonly Dictionary<JsonNode, Uri> bases = new(ReferenceEqualityComparer.Instance);
     private readonly HashSet<(JsonNode Schema, JsonNode? Value)> evaluating = [];
-    private readonly Queue<JsonNode> pendingSchemas = new();
+    private readonly HashSet<JsonNode> compiledSchemas = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<string, Regex> patterns = new(StringComparer.Ordinal);
     private static readonly Uri DefaultBase = new("https://mcp-cli.invalid/schema");
     private static readonly string[] SchemaMaps = ["properties", "patternProperties", "definitions", "$defs"];
@@ -28,21 +28,36 @@ public sealed class OutputSchema
         root = schema;
         this.registry = registry;
         Index(schema, DefaultBase);
-        CompilePendingSchemas();
+        CompileSchema(schema);
         foreach (var id in references.Keys) registry.TryAdd(id, this);
     }
 
-    private void CompilePendingSchemas()
+    private void CompileSchema(JsonNode node)
     {
-        while (pendingSchemas.TryDequeue(out var pending))
+        if (!compiledSchemas.Add(node) || node is not JsonObject schema) return;
+        ValidateKeywordTypes(schema);
+        if (schema["$ref"] is { } reference)
         {
-            if (pending is not JsonObject node) continue;
-            ValidateKeywordTypes(node);
-            if (node["$ref"] is { } reference) _ = Resolve(node, reference.GetValue<string>());
-            if (node["pattern"] is { } pattern) CompilePattern(pattern.GetValue<string>());
-            if (node["patternProperties"] is JsonObject properties)
-                foreach (var name in properties.Select(p => p.Key)) CompilePattern(name);
+            var (owner, target) = Resolve(schema, reference.GetValue<string>());
+            owner.CompileSchema(target);
         }
+        if (schema["pattern"] is { } pattern) CompilePattern(pattern.GetValue<string>());
+        if (schema["patternProperties"] is JsonObject properties)
+            foreach (var name in properties.Select(p => p.Key)) CompilePattern(name);
+        foreach (var key in new[] { "properties", "patternProperties" })
+            if (schema[key] is JsonObject children)
+                foreach (var child in children.Select(p => p.Value).OfType<JsonNode>()) CompileSchema(child);
+        foreach (var key in SchemaSingles)
+            if (schema[key] is { } child) CompileSchema(child);
+        foreach (var key in new[] { "allOf", "anyOf", "oneOf", "items" })
+        {
+            if (schema[key] is JsonArray children)
+                foreach (var child in children.OfType<JsonNode>()) CompileSchema(child);
+            else if (schema[key] is { } child) CompileSchema(child);
+        }
+        if (schema["dependencies"] is JsonObject dependencies)
+            foreach (var child in dependencies.Select(p => p.Value).Where(n => n is JsonObject or JsonValue).OfType<JsonNode>())
+                CompileSchema(child);
     }
 
     public static OutputSchema Compile(JsonObject schema, IDictionary<string, OutputSchema> registry)
@@ -65,7 +80,6 @@ public sealed class OutputSchema
                 throw new InvalidDataException($"Duplicate output schema ID: {baseUri}");
         }
         bases[schema] = baseUri;
-        pendingSchemas.Enqueue(schema);
         if (schema is not JsonObject map) return;
         foreach (var key in SchemaMaps)
             if (map[key] is JsonObject properties)
@@ -116,7 +130,6 @@ public sealed class OutputSchema
             var ancestor = target.Parent;
             while (ancestor is not null && !bases.ContainsKey(ancestor)) ancestor = ancestor.Parent;
             Index(target, ancestor is null ? bases[source] : bases[ancestor]);
-            CompilePendingSchemas();
         }
         return (this, target);
     }
@@ -263,7 +276,8 @@ public sealed class OutputSchema
     private static double Number(JsonNode node) => double.Parse(node.ToJsonString(), CultureInfo.InvariantCulture);
     private static bool Below(JsonObject rules, string key, double value) => rules[key] is { } limit && value < Number(limit);
     private static bool Above(JsonObject rules, string key, double value) => rules[key] is { } limit && value > Number(limit);
-    private static Regex Pattern(string pattern, bool ignoreCase = false) => new(pattern,
+    private static Regex Pattern(string pattern, bool ignoreCase = false) => new(
+        pattern.EndsWith('$') ? pattern[..^1] + @"\z" : pattern,
         RegexOptions.ECMAScript | RegexOptions.CultureInvariant | (ignoreCase ? RegexOptions.IgnoreCase : RegexOptions.None),
         TimeSpan.FromSeconds(1));
 
@@ -291,6 +305,9 @@ public sealed class OutputSchema
                     break;
                 case "nullable":
                     Require(value?.GetValueKind() is JsonValueKind.True or JsonValueKind.False && schema.ContainsKey("type"), key);
+                    if (value?.ToString() == "false")
+                        Require(schema["type"]?.ToString() != "null" &&
+                            !(schema["type"] is JsonArray union && union.Any(t => t?.ToString() == "null")), key);
                     break;
                 case "minLength" or "maxLength" or "minItems" or "maxItems" or "minProperties" or "maxProperties" or
                     "minimum" or "maximum" or "exclusiveMinimum" or "exclusiveMaximum" or "multipleOf":
@@ -331,17 +348,27 @@ public sealed class OutputSchema
             case "ipv4": return text.Split('.') is { Length: 4 } parts &&
                 parts.All(p => Pattern(@"^(0|[1-9]\d{0,2})$").IsMatch(p) && int.Parse(p) <= 255);
             case "ipv6": return IPAddress.TryParse(text, out var address) && address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
-            case "uri": return !text.Any(char.IsWhiteSpace) && Uri.TryCreate(text, UriKind.Absolute, out _);
+            case "uri": return Pattern(
+                """^(?:[a-z][a-z0-9+\-.]*:)(?:\/?\/(?:(?:[a-z0-9\-._~!$&'()*+,;=:]|%[0-9a-f]{2})*@)?(?:\[(?:(?:(?:(?:[0-9a-f]{1,4}:){6}|::(?:[0-9a-f]{1,4}:){5}|(?:[0-9a-f]{1,4})?::(?:[0-9a-f]{1,4}:){4}|(?:(?:[0-9a-f]{1,4}:){0,1}[0-9a-f]{1,4})?::(?:[0-9a-f]{1,4}:){3}|(?:(?:[0-9a-f]{1,4}:){0,2}[0-9a-f]{1,4})?::(?:[0-9a-f]{1,4}:){2}|(?:(?:[0-9a-f]{1,4}:){0,3}[0-9a-f]{1,4})?::[0-9a-f]{1,4}:|(?:(?:[0-9a-f]{1,4}:){0,4}[0-9a-f]{1,4})?::)(?:[0-9a-f]{1,4}:[0-9a-f]{1,4}|(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?))|(?:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4})?::[0-9a-f]{1,4}|(?:(?:[0-9a-f]{1,4}:){0,6}[0-9a-f]{1,4})?::)|[Vv][0-9a-f]+\.[a-z0-9\-._~!$&'()*+,;=:]+)\]|(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)|(?:[a-z0-9\-._~!$&'()*+,;=]|%[0-9a-f]{2})*)(?::\d*)?(?:\/(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})*)*|\/(?:(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})+(?:\/(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})*)*)?|(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})+(?:\/(?:[a-z0-9\-._~!$&'()*+,;=:@]|%[0-9a-f]{2})*)*)(?:\?(?:[a-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9a-f]{2})*)?(?:#(?:[a-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9a-f]{2})*)?$""",
+                true).IsMatch(text);
             case "url": return Pattern(@"^(?:https?|ftp)://(?:\S+(?::\S*)?@)?(?:(?!(?:10|127)(?:\.\d{1,3}){3})(?!(?:169\.254|192\.168)(?:\.\d{1,3}){2})(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?:[1-9]\d?|1\d\d|2[01]\d|22[0-3])(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5])){2}(?:\.(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-4]))|(?:(?:[a-z0-9\u00a1-\uffff]+-)*[a-z0-9\u00a1-\uffff]+)(?:\.(?:[a-z0-9\u00a1-\uffff]+-)*[a-z0-9\u00a1-\uffff]+)*(?:\.(?:[a-z\u00a1-\uffff]{2,})))(?::\d{2,5})?(?:/[^\s]*)?$", true).IsMatch(text);
             case "uri-reference": return !text.Any(char.IsWhiteSpace) && Uri.TryCreate(text, UriKind.RelativeOrAbsolute, out _);
-            case "uri-template": return Pattern(@"^(?:[^{}\s]|\{[+#./;?&=,!@|]?[a-zA-Z0-9_%]+(?::[1-9]\d{0,3}|\*)?(?:,[a-zA-Z0-9_%]+(?::[1-9]\d{0,3}|\*)?)*\})*$").IsMatch(text);
+            case "uri-template": return Pattern(
+                """^(?:(?:[^\x00-\x20"'<>%\\^`{|}]|%[0-9a-f]{2})|\{[+#./;?&=,!@|]?(?:[a-z0-9_]|%[0-9a-f]{2})+(?::[1-9][0-9]{0,3}|\*)?(?:,(?:[a-z0-9_]|%[0-9a-f]{2})+(?::[1-9][0-9]{0,3}|\*)?)*\})*$""",
+                true).IsMatch(text);
             case "uuid": return Pattern(@"^(?:urn:uuid:)?[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$", true).IsMatch(text);
             case "json-pointer": return Pattern(@"^(?:/(?:[^~/]|~[01])*)*$").IsMatch(text);
+            case "json-pointer-uri-fragment": return Pattern(@"^#(?:/(?:[a-z0-9_\-.!$&'()*+,;:=@]|%[0-9a-f]{2}|~0|~1)*)*$", true).IsMatch(text);
             case "relative-json-pointer": return Pattern(@"^(?:0|[1-9]\d*)(?:#|(?:/(?:[^~/]|~[01])*)*)$").IsMatch(text);
             case "byte": return Pattern(@"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$").IsMatch(text);
             case "regex":
-                try { _ = Pattern(text); return true; }
-                catch (ArgumentException) { return false; }
+                try
+                {
+                    SchemaRegex.ValidateGroupSyntax(text);
+                    _ = new Regex(text, RegexOptions.ECMAScript | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+                    return true;
+                }
+                catch (Exception error) when (error is ArgumentException or InvalidDataException) { return false; }
             default: return true; // Unknown formats are annotations in upstream AJV's non-strict mode.
         }
     }

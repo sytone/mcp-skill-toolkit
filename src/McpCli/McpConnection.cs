@@ -55,7 +55,9 @@ public sealed class McpConnection(RpcConnection rpc, ServerConfig config, Runtim
             }
         }, $"connect to {name}", settings, cancellationToken);
 
-    public async Task<ToolInfo[]> ListToolsAsync(CancellationToken cancellationToken)
+    public Task<ToolInfo[]> ListToolsAsync(CancellationToken cancellationToken) => ListToolsAsync(cancellationToken, null);
+
+    internal async Task<ToolInfo[]> ListToolsAsync(CancellationToken cancellationToken, RetryOptions? options)
     {
         return await Retry.RunAsync(async token =>
         {
@@ -74,10 +76,13 @@ public sealed class McpConnection(RpcConnection rpc, ServerConfig config, Runtim
             }
             Interlocked.Exchange(ref metadata, discovered);
             return parsed.Where(t => config.IsToolAllowed(t.Name)).ToArray();
-        }, "list tools", settings, cancellationToken);
+        }, "list tools", settings, cancellationToken, options);
     }
 
-    public Task<JsonNode?> CallToolAsync(string name, JsonNode? arguments, CancellationToken cancellationToken)
+    public Task<JsonNode?> CallToolAsync(string name, JsonNode? arguments, CancellationToken cancellationToken) =>
+        CallToolAsync(name, arguments, cancellationToken, null);
+
+    internal Task<JsonNode?> CallToolAsync(string name, JsonNode? arguments, CancellationToken cancellationToken, RetryOptions? options)
     {
         if (!config.IsToolAllowed(name)) throw new InvalidOperationException($"Tool \"{name}\" is disabled by configuration");
         var tool = Volatile.Read(ref metadata).GetValueOrDefault(name);
@@ -96,7 +101,7 @@ public sealed class McpConnection(RpcConnection rpc, ServerConfig config, Runtim
                     throw new McpException(-32602, "Structured content does not match the tool's output schema");
             }
             return obj;
-        }, $"call tool {name}", settings, cancellationToken);
+        }, $"call tool {name}", settings, cancellationToken, options);
     }
 
     public Task<string?> GetInstructionsAsync(CancellationToken cancellationToken) => Task.FromResult(rpc.Instructions);

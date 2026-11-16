@@ -74,6 +74,19 @@ Cancellation tests must observe the notification and cancellation at the
 server; local task cancellation alone is insufficient. Never infer network
 error codes from an MCP error's message text.
 
+Keep the `RoundTwo*` regressions as well, especially cached caller cancellation,
+per-request settings, and persistent HTTP GET response streams. Test deadlines
+must bound stdin/stdout/stderr as well as process exit. Fixture lifetime markers
+are instance-specific; historical PID logs are not proof of process ownership.
+
+User-authorized live smoke checks must remain separate from the offline test
+suite. Inspect schemas and default to clearly read-only tools. Writes require
+explicit user authorization for the test objects and changes. Disable retries,
+read back created objects, and report their IDs for cleanup; never repeat an
+uncertain write without first checking whether it succeeded. Inspect backend
+status and in-band errors, and keep all private output temporary. Never commit
+server inventories, created object IDs, or credentials as regression fixtures.
+
 When adding source or tests, extend the explicit allowlists in
 `../psakefile.ps1` and `../tests/Build.Tests.ps1`. Never package `bin/`, `obj/`,
 test output, configuration, secrets, or recursive directory exports.
