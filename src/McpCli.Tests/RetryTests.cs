@@ -61,4 +61,38 @@ public sealed class RetryTests
         Assert.IsTrue(Retry.IsTransient(error));
         Assert.IsTrue(Retry.IsTransient(new IOException("Transport failed", error)));
     }
+
+    [TestMethod]
+    public void ParityNativeBrokenPipeErrorsAreRetryableButErrorTextIsNot()
+    {
+        Assert.IsTrue(Retry.IsTransient(new System.Net.Sockets.SocketException(32)));
+        Assert.IsTrue(Retry.IsTransient(new System.Net.Sockets.SocketException(
+            (int)System.Net.Sockets.SocketError.Shutdown)));
+        if (OperatingSystem.IsWindows())
+        {
+            var brokenPipe = new System.ComponentModel.Win32Exception(109);
+            Assert.IsTrue(Retry.IsTransient(brokenPipe));
+            Assert.IsTrue(Retry.IsTransient(new IOException("Pipe closed", brokenPipe)));
+        }
+        Assert.IsFalse(Retry.IsTransient(new IOException("EPIPE while validating input")));
+    }
+
+    [TestMethod]
+    public async Task ParityRetryPolicyRetriesANativeBrokenPipeFailure()
+    {
+        var attempts = 0;
+        var settings = new RuntimeSettings
+        {
+            Environment = name => name switch { "MCP_MAX_RETRIES" => "1", "MCP_RETRY_DELAY" => "1", _ => null }
+        };
+        var result = await Retry.RunAsync(_ =>
+        {
+            attempts++;
+            return attempts == 1
+                ? Task.FromException<int>(new System.ComponentModel.Win32Exception(109))
+                : Task.FromResult(42);
+        }, "test", settings, CancellationToken.None);
+        Assert.AreEqual(42, result);
+        Assert.AreEqual(2, attempts);
+    }
 }

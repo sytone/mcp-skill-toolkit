@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text.RegularExpressions;
@@ -11,6 +12,13 @@ public static class Retry
     public static bool IsTransient(Exception error)
     {
         if (error is HttpRequestException { StatusCode: { } status } && (int)status is 429 or 502 or 503 or 504)
+            return true;
+        if (error is SocketException socketError &&
+            ((int)socketError.SocketErrorCode == 32 || socketError.SocketErrorCode == SocketError.Shutdown))
+            return true;
+        if (error is Win32Exception win32Error && OperatingSystem.IsWindows() && win32Error.NativeErrorCode == 109)
+            return true;
+        if (error is IOException ioError && OperatingSystem.IsWindows() && (ioError.HResult & 0xffff) == 109)
             return true;
         if (error is SocketException socket && socket.SocketErrorCode is
             SocketError.ConnectionRefused or SocketError.ConnectionReset or SocketError.TimedOut or
