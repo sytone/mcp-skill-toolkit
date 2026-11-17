@@ -104,7 +104,12 @@ public sealed class Output(bool colorize)
             lines.Add("");
         }
         lines.Add(Bold("Input Schema:"));
-        lines.Add(Json(tool.InputSchema));
+        var schemaOrder = new[] { "type", "properties", "required" };
+        var orderedSchema = new JsonObject(schemaOrder.Where(tool.InputSchema.ContainsKey)
+            .Concat(tool.InputSchema.Select(property => property.Key)
+                .Where(key => !schemaOrder.Contains(key, StringComparer.Ordinal)))
+            .Select(key => KeyValuePair.Create(key, tool.InputSchema[key]?.DeepClone())));
+        lines.Add(Json(orderedSchema));
         return string.Join('\n', lines);
     }
 

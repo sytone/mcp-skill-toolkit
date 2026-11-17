@@ -30,6 +30,22 @@ public sealed class TransportTests
     }
 
     [TestMethod]
+    public void ParityToolSchemaUsesUpstreamJsonSchemaKeywordOrder()
+    {
+        var schema = new JsonObject
+        {
+            ["required"] = new JsonArray("query"),
+            ["properties"] = new JsonObject { ["query"] = new JsonObject { ["type"] = "string" } },
+            ["type"] = "object"
+        };
+        var output = new Output(false).ToolSchema("server", new ToolInfo("search", null, schema));
+        Assert.IsTrue(output.IndexOf("\"type\": \"object\"", StringComparison.Ordinal) <
+            output.IndexOf("\"properties\": {", StringComparison.Ordinal));
+        Assert.IsTrue(output.IndexOf("\"properties\": {", StringComparison.Ordinal) <
+            output.IndexOf("\"required\": [", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
     [DataRow(false)]
     [DataRow(true)]
     public async Task InlineAndStdinUnicodePayloadsPreserveRawText(bool stdin)
