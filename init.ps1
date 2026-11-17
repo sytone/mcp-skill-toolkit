@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [switch]$SkipMcpCli
+    [switch]$SkipMcpCli,
+    [ValidateSet('dotnet', 'bun')]
+    [string]$McpCliBackend
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,6 +60,8 @@ function Install-RequiredModule {
 }
 
 function Find-McpCli {
+    param([switch]$IgnoreConfiguredPath)
+
     $command = Get-Command mcp-cli -ErrorAction SilentlyContinue
     if ($null -ne $command) {
         return $command.Source
@@ -72,7 +76,7 @@ function Find-McpCli {
         }
     }
 
-    if (Test-Path (Join-Path $PSScriptRoot 'servers.json')) {
+    if (-not $IgnoreConfiguredPath -and (Test-Path (Join-Path $PSScriptRoot 'servers.json'))) {
         $config = Get-Content -Raw -Path (Join-Path $PSScriptRoot 'servers.json') | ConvertFrom-Json
         $configuredPath = [string]$config.mcp_cli_path
         if (-not [string]::IsNullOrWhiteSpace($configuredPath) -and $configuredPath -ne 'mcp-cli') {
@@ -89,6 +93,93 @@ function Find-McpCli {
     }
 
     return $null
+}
+
+function Get-McpCliBackend {
+    param(
+        [string]$RequestedBackend,
+        [string]$ConfigPath = (Join-Path $PSScriptRoot 'servers.json')
+    )
+
+    $backend = $RequestedBackend
+    if ([string]::IsNullOrWhiteSpace($backend) -and (Test-Path -LiteralPath $ConfigPath)) {
+        $config = Get-Content -Raw -LiteralPath $ConfigPath | ConvertFrom-Json
+        $backend = [string]$config.mcp_cli_backend
+    }
+    if ([string]::IsNullOrWhiteSpace($backend)) {
+        $backend = 'dotnet'
+    }
+
+    $backend = $backend.Trim().ToLowerInvariant()
+    if ($backend -notin @('dotnet', 'bun')) {
+        throw "Unsupported MCP CLI backend '$backend'. Choose 'dotnet' or 'bun'."
+    }
+
+    return $backend
+}
+
+function Find-DotNetMcpCli {
+    $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+    if ($null -eq $dotnet) {
+        throw '.NET SDK 10 is required for the dotnet MCP CLI backend. Install the SDK or select -McpCliBackend bun.'
+    }
+
+    $projectPath = Join-Path $PSScriptRoot 'src\McpCli\McpCli.csproj'
+    & $dotnet.Source build $projectPath --configuration Release --nologo | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Building the local MCP CLI failed (exit code $LASTEXITCODE)."
+    }
+
+    $cliPath = Join-Path $PSScriptRoot 'src\McpCli\bin\Release\net10.0\mcp-cli.exe'
+    if (-not (Test-Path -LiteralPath $cliPath)) {
+        throw "The local MCP CLI build succeeded but its executable was not found: $cliPath"
+    }
+
+    return (Resolve-Path -LiteralPath $cliPath).Path
+}
+
+function Get-McpCliExecutable {
+    param(
+        [string]$Backend,
+        [switch]$IgnoreConfiguredPath
+    )
+
+    if ($Backend -eq 'dotnet') {
+        return Find-DotNetMcpCli
+    }
+
+    $mcpCli = Find-McpCli -IgnoreConfiguredPath:$IgnoreConfiguredPath
+    if ($null -ne $mcpCli) {
+        return $mcpCli
+    }
+
+    $bunCommand = Get-Command bun -ErrorAction SilentlyContinue
+    $bunPath = if ($null -ne $bunCommand) { $bunCommand.Source } else { $null }
+    if ($null -eq $bunPath) {
+        $installedBunPath = Join-Path $HOME '.bun\bin\bun.exe'
+        if (Test-Path $installedBunPath) {
+            $bunPath = $installedBunPath
+        }
+    }
+    if ($null -eq $bunPath) {
+        Write-InitLog 'Installing Bun...'
+        Invoke-RestMethod https://bun.sh/install.ps1 | Invoke-Expression
+        $installedBunPath = Join-Path $HOME '.bun\bin\bun.exe'
+        if (Test-Path $installedBunPath) {
+            $bunPath = $installedBunPath
+        }
+    }
+    if ($null -eq $bunPath) {
+        throw 'Bun could not be installed. Install Bun and rerun init.ps1.'
+    }
+
+    Write-InitLog 'Installing mcp-cli from GitHub...'
+    & $bunPath install -g github:philschmid/mcp-cli
+    if ($LASTEXITCODE -ne 0) {
+        throw "Bun failed to install mcp-cli (exit code $LASTEXITCODE)."
+    }
+
+    return Find-McpCli
 }
 
 function Find-Agency {
@@ -153,6 +244,7 @@ function ConvertTo-LocalConfigPath {
 function Set-LocalToolPaths {
     param(
         [string]$McpCliPath,
+        [string]$McpCliBackend,
         [string]$AgencyPath,
         [string]$ConfigPath = (Join-Path $PSScriptRoot 'servers.json')
     )
@@ -164,8 +256,10 @@ function Set-LocalToolPaths {
 
     $config = Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json -AsHashtable -Depth 100
     $configuredMcpCliPath = ConvertTo-LocalConfigPath -Path $McpCliPath
-    $changed = $config.mcp_cli_path -ne $configuredMcpCliPath
+    $changed = $config.mcp_cli_path -ne $configuredMcpCliPath -or
+        $config.mcp_cli_backend -ne $McpCliBackend
     $config.mcp_cli_path = $configuredMcpCliPath
+    $config.mcp_cli_backend = $McpCliBackend
 
     if (-not [string]::IsNullOrWhiteSpace($AgencyPath)) {
         $configuredAgencyPath = ConvertTo-LocalConfigPath -Path $AgencyPath
@@ -187,9 +281,11 @@ function Set-LocalToolPaths {
 function Initialize-ConfiguredToolPaths {
     param(
         [string]$McpCliPath,
+        [string]$McpCliBackend,
         [string]$ConfigPath = (Join-Path $PSScriptRoot 'servers.json')
     )
 
+    $McpCliBackend = Get-McpCliBackend -RequestedBackend $McpCliBackend -ConfigPath $ConfigPath
     $agency = $null
     if (Test-ConfigRequiresAgency -ConfigPath $ConfigPath) {
         $agency = Find-Agency
@@ -202,52 +298,26 @@ function Initialize-ConfiguredToolPaths {
         Write-InitLog 'No enabled server command requires Agency; skipping its path check.' 'SKIP'
     }
 
-    Set-LocalToolPaths -McpCliPath $McpCliPath -AgencyPath $agency -ConfigPath $ConfigPath
+    Set-LocalToolPaths -McpCliPath $McpCliPath -McpCliBackend $McpCliBackend -AgencyPath $agency -ConfigPath $ConfigPath
 }
 
 Install-RequiredModule -Name psake -RequiredVersion ([version]'5.0.4')
 Install-RequiredModule -Name Pester -RequiredVersion ([version]'5.7.1')
 
 if ($SkipMcpCli.IsPresent) {
-    Write-InitLog 'Skipping external CLI checks.' 'SKIP'
+    Write-InitLog 'Skipping MCP CLI setup and checks.' 'SKIP'
     return
 }
 
-$mcpCli = Find-McpCli
-if ($null -eq $mcpCli) {
-    $bunCommand = Get-Command bun -ErrorAction SilentlyContinue
-    $bunPath = if ($null -ne $bunCommand) { $bunCommand.Source } else { $null }
-    if ($null -eq $bunPath) {
-        $installedBunPath = Join-Path $HOME '.bun\bin\bun.exe'
-        if (Test-Path $installedBunPath) {
-            $bunPath = $installedBunPath
-        }
-    }
-    if ($null -eq $bunPath) {
-        Write-InitLog 'Installing Bun...'
-        Invoke-RestMethod https://bun.sh/install.ps1 | Invoke-Expression
-        $installedBunPath = Join-Path $HOME '.bun\bin\bun.exe'
-        if (Test-Path $installedBunPath) {
-            $bunPath = $installedBunPath
-        }
-    }
-
-    if ($null -eq $bunPath) {
-        throw 'Bun could not be installed. Install Bun and rerun init.ps1.'
-    }
-
-    Write-InitLog 'Installing mcp-cli from GitHub...'
-    & $bunPath install -g github:philschmid/mcp-cli
-    if ($LASTEXITCODE -ne 0) {
-        throw "Bun failed to install mcp-cli (exit code $LASTEXITCODE)."
-    }
-    $mcpCli = Find-McpCli
-}
+$configuredBackend = Get-McpCliBackend
+$selectedBackend = Get-McpCliBackend -RequestedBackend $McpCliBackend
+$ignoreConfiguredPath = -not [string]::IsNullOrWhiteSpace($McpCliBackend) -and $selectedBackend -ne $configuredBackend
+$mcpCli = Get-McpCliExecutable -Backend $selectedBackend -IgnoreConfiguredPath:$ignoreConfiguredPath
 
 if ($null -eq $mcpCli) {
-    throw 'mcp-cli was installed but could not be resolved. Add the Bun global bin directory to PATH or update mcp_cli_path in servers.json.'
+    throw "The $selectedBackend MCP CLI was prepared but could not be resolved."
 }
 
 Write-InitLog "mcp-cli is available at $mcpCli" 'DONE'
 
-Initialize-ConfiguredToolPaths -McpCliPath $mcpCli
+Initialize-ConfiguredToolPaths -McpCliPath $mcpCli -McpCliBackend $selectedBackend

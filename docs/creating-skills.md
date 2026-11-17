@@ -9,7 +9,7 @@ Each entry needs a name, command array, description, transport, and enabled flag
 
 ```json
 {
-  "mcp_cli_path": "mcp-cli",
+  "mcp_cli_backend": "dotnet",
   "servers": {
     "my-tools": {
       "command": ["node", "C:/tools/my-server/server.js"],
@@ -25,9 +25,14 @@ Use a stable, lowercase, hyphenated server name. It becomes the skill directory
 and the skill's frontmatter `name`. A useful description says what the tools do
 and when an agent should use them.
 
-For stdio servers, the command and arguments are emitted into the MCP CLI
-configuration. Live discovery starts that command through MCP CLI. The toolkit
-does not install each server or supply its credentials.
+The default `mcp_cli_backend` is `dotnet`, which builds and runs the local C#
+CLI under `src/`. Set it to `bun` to use the legacy Bun-based CLI. The optional
+`mcp_cli_path` points to an executable for the selected backend. These fields
+configure the toolkit and are not passed to MCP servers.
+
+For stdio servers, the command and arguments are emitted into the MCP server
+configuration. Live discovery starts that command through the selected CLI.
+The toolkit does not install each server or supply its credentials.
 
 For non-stdio entries, `default_port` and `endpoint` become a loopback URL such
 as `http://127.0.0.1:3500/mcp`. The toolkit does not start the HTTP server. An
@@ -61,13 +66,19 @@ Only enabled servers are included. `SelectedServerNames` accepts a
 comma-separated list and limits generated skills; it does not narrow the
 shared MCP CLI configuration, which includes all enabled entries.
 
-The offline build creates a generic runner but no per-tool scripts because
-there is no captured tool inventory.
+The offline build still builds/resolves the selected CLI so generated runners
+can contain its executable path. With the default backend this requires the
+.NET 10 SDK but does not start MCP servers or contact MCP services. The build
+creates a generic runner but no per-tool scripts because there is no captured
+tool inventory.
 
 ## 3. Discover the tools
 
-Install MCP CLI and the selected server's dependencies, authenticate using that
-server's supported process, then repeat the build without `SkipDiscovery`:
+Initialize the selected CLI backend and install the selected server's own
+dependencies. The .NET backend is the default and requires the .NET 10 SDK;
+select `"mcp_cli_backend": "bun"` if you need the legacy Bun CLI. Authenticate
+using the server's supported process, then repeat the build without
+`SkipDiscovery`:
 
 ```powershell
 Invoke-psake -TaskList Build -Properties @{
@@ -76,6 +87,13 @@ Invoke-psake -TaskList Build -Properties @{
 }
 if (-not $psake.build_success) { throw 'Build failed.' }
 ```
+
+Existing configs with a `mcp_cli_path` that points to Bun can continue to use
+that executable. To make the backend choice explicit, set
+`mcp_cli_backend` to `bun`; to migrate to the local .NET CLI, select `dotnet`
+and run `init.ps1`, which builds the local executable and records its path.
+An invocation-level `McpCliBackend` psake property takes precedence over the
+config selector, and `McpCliPath` can provide an executable-path override.
 
 Read the result in three places:
 

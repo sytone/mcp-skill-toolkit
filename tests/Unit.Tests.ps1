@@ -232,6 +232,21 @@ Describe 'Build source unit behavior' {
             $result.mcpServers.Count | Should -Be 0
         }
 
+        It 'keeps toolkit backend metadata out of the generated MCP server config' {
+            $config = [pscustomobject]@{
+                mcp_cli_backend = 'bun'
+                mcp_cli_path = 'custom-cli'
+                servers = [pscustomobject]@{
+                    demo = [pscustomobject]@{ command = @('node', 'server.js'); transport = 'stdio'; enabled = $true }
+                }
+            }
+
+            $result = ConvertTo-McpCliConfig -ConfigObject $config
+
+            @($result.Keys) | Should -Be @('mcpServers')
+            $result.mcpServers.demo.command | Should -BeExactly 'node'
+        }
+
         It 'converts local Agency commands to quiet stdio and resolves a configured executable only once' {
             $script:UnitAgencyExecutable = Join-Path $script:BuildUnitCaseRoot 'agency.exe'
             Mock Resolve-AgencyPath { return $script:UnitAgencyExecutable }
@@ -773,13 +788,17 @@ Describe 'Build executable resolver boundaries (offline)' {
         if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
         foreach ($definition in @($ast.EndBlock.Statements | Where-Object {
             $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $_.Name -in @('Resolve-UserPath', 'Write-BuildLog', 'Resolve-McpCliPath', 'Resolve-AgencyPath')
+                $_.Name -in @(
+                    'Resolve-UserPath', 'Write-BuildLog', 'Get-ConfiguredMcpCliBackend',
+                    'Resolve-McpCliBackend', 'Resolve-DotNetMcpCliPath', 'Resolve-McpCliPath',
+                    'Resolve-AgencyPath'
+                )
         })) {
             Set-Item -Path ('Function:' + $definition.Name) -Value $definition.Body.GetScriptBlock()
         }
     }
     BeforeEach {
-        Mock Get-Command { return $null } -ParameterFilter { $Name -in @('mcp-cli', 'custom-cli', 'agency') }
+        Mock Get-Command { return $null } -ParameterFilter { $Name -in @('mcp-cli', 'custom-cli', 'agency', 'dotnet') }
         Mock Test-Path { return $false }
         Mock Resolve-Path { [pscustomobject]@{ Path = [IO.Path]::GetFullPath($Path) } }
         Mock Write-BuildLog { }
@@ -789,6 +808,24 @@ Describe 'Build executable resolver boundaries (offline)' {
         Resolve-McpCliPath -RequestedPath 'custom-cli' | Should -Be 'fixture-custom-cli'
         Should -Invoke Get-Command -Times 0 -Exactly -ParameterFilter { $Name -eq 'mcp-cli' }
     }
+    It 'defaults backend selection to .NET and honors configured and invocation choices' {
+        $config = [pscustomobject]@{ servers = [pscustomobject]@{} }
+        Get-ConfiguredMcpCliBackend -ConfigObject $config | Should -Be 'dotnet'
+
+        $config | Add-Member -NotePropertyName mcp_cli_backend -NotePropertyValue 'BUN'
+        Get-ConfiguredMcpCliBackend -ConfigObject $config | Should -Be 'bun'
+        Resolve-McpCliBackend -RequestedBackend 'dotnet' -ConfigObject $config | Should -Be 'dotnet'
+        { Resolve-McpCliBackend -RequestedBackend 'remote' -ConfigObject $config } |
+            Should -Throw '*Choose ''dotnet'' or ''bun''*'
+    }
+    It 'uses the local .NET executable as the default without searching Bun locations' {
+        Mock Resolve-DotNetMcpCliPath { return 'fixture-dotnet-cli' }
+
+        Resolve-McpCliPath | Should -Be 'fixture-dotnet-cli'
+
+        Should -Invoke Resolve-DotNetMcpCliPath -Times 1 -Exactly -Scope It
+        Should -Invoke Get-Command -Times 0 -Exactly -Scope It -ParameterFilter { $Name -eq 'mcp-cli' }
+    }
     It 'resolves an explicit existing CLI path without a PATH lookup' {
         $script:ResolverExplicit = Join-Path $script:ResolverRepo '.test-tmp/resolver/mcp-cli.exe'
         Mock Test-Path { $Path -eq $script:ResolverExplicit }
@@ -797,16 +834,16 @@ Describe 'Build executable resolver boundaries (offline)' {
     }
     It 'falls back from a missing CLI path to PATH with a warning' {
         Mock Get-Command { [pscustomobject]@{ Source = 'fixture-path-cli' } } -ParameterFilter { $Name -eq 'mcp-cli' }
-        Resolve-McpCliPath -RequestedPath './missing-cli' | Should -Be 'fixture-path-cli'
+        Resolve-McpCliPath -RequestedPath './missing-cli' -Backend bun | Should -Be 'fixture-path-cli'
         Should -Invoke Write-BuildLog -Times 1 -Exactly -ParameterFilter { $Label -eq 'WARN' }
     }
     It 'uses an installed Bun candidate when no command can be resolved' {
         $script:ResolverCandidate = Join-Path $HOME '.bun/bin/mcp-cli.exe'
         Mock Test-Path { $Path -eq $script:ResolverCandidate }
-        Resolve-McpCliPath | Should -Be ([IO.Path]::GetFullPath($script:ResolverCandidate))
+        Resolve-McpCliPath -Backend bun | Should -Be ([IO.Path]::GetFullPath($script:ResolverCandidate))
     }
     It 'reports missing MCP CLI instead of returning an unusable executable' {
-        { Resolve-McpCliPath -RequestedPath 'custom-cli' } | Should -Throw '*mcp-cli was not found*'
+        { Resolve-McpCliPath -RequestedPath 'custom-cli' -Backend bun } | Should -Throw '*mcp-cli was not found*'
     }
     It 'resolves a requested home-relative Agency path without checking PATH' {
         $script:ResolverCandidate = Join-Path $HOME 'fixture-tools/agency.exe'

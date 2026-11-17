@@ -52,7 +52,7 @@ Describe 'Offline source integration and safety boundaries' {
         $PackagePath = Join-Path $script:IntegrationRoot 'setup.zip'
         $SourceSkillsDir = Join-Path $OutputDir 'skills'
         $TargetSkillsDir = Join-Path $script:IntegrationRoot 'staged-skills'
-        Mock Resolve-McpCliPath { throw 'Unexpected executable lookup.' }
+        Mock Resolve-McpCliPath { return 'fixture-dotnet-cli' }
         Mock Resolve-AgencyPath { throw 'Unexpected Agency lookup.' }
         Mock Start-Job { throw 'Unexpected live discovery.' }
     }
@@ -73,6 +73,9 @@ Describe 'Offline source integration and safety boundaries' {
         Test-Path -LiteralPath (Join-Path $stale 'Invoke-Tool.ps1') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path (Split-Path -Parent $stale) 'tool_policy.json') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $TargetSkillsDir 'everything/SKILL.md') | Should -BeTrue
+        $runnerText = Get-Content -Raw -LiteralPath (Join-Path $OutputDir 'skills/everything/scripts/Invoke-Tool.ps1')
+        $runnerText | Should -Match 'fixture-dotnet-cli'
+        Should -Invoke Resolve-McpCliPath -Times 1 -Exactly
         $summary = @(Get-Content -Raw -LiteralPath (Join-Path $OutputDir 'build-summary.json') | ConvertFrom-Json)
         $summary.Count | Should -Be 1
         $summary[0].server | Should -Be 'everything'

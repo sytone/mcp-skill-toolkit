@@ -77,3 +77,14 @@ Assert-TestRunSucceeded -Result $result
 if ($Coverage -and ($result.CodeCoverage.CommandsAnalyzedCount -eq 0 -or $result.CodeCoverage.CoveragePercent -lt $MinimumCoverage)) {
     throw "Coverage $($result.CodeCoverage.CoveragePercent.ToString('F2'))% is below $MinimumCoverage%."
 }
+
+$dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+if ($null -eq $dotnet) {
+    throw '.NET SDK 10 is required to run the local MCP CLI MSTest suite.'
+}
+
+$solutionPath = Join-Path $repoRoot 'src\McpCli.slnx'
+& $dotnet.Source test $solutionPath --configuration Release
+if ($LASTEXITCODE -ne 0) {
+    throw "MSTest process failed (exit code $LASTEXITCODE)."
+}

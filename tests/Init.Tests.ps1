@@ -73,6 +73,48 @@ Describe 'MCP CLI initializer helpers' {
         Should -Invoke Find-Agency -Times 0 -Exactly -Scope It
     }
 
+    It 'defaults to the local .NET backend and allows the invocation choice to override config' {
+        & $script:WriteConfig @{ mcp_cli_backend = 'bun'; servers = @{} }
+
+        Get-McpCliBackend -ConfigPath $script:ConfigPath | Should -Be 'bun'
+        Get-McpCliBackend -RequestedBackend 'dotnet' -ConfigPath $script:ConfigPath | Should -Be 'dotnet'
+
+        & $script:WriteConfig @{ servers = @{} }
+        Get-McpCliBackend -ConfigPath $script:ConfigPath | Should -Be 'dotnet'
+        { Get-McpCliBackend -RequestedBackend 'remote' -ConfigPath $script:ConfigPath } |
+            Should -Throw '*Choose ''dotnet'' or ''bun''*'
+    }
+
+    It 'builds and resolves the local CLI apphost from source' {
+        $cliPath = Find-DotNetMcpCli
+
+        $cliPath | Should -Be (Join-Path $script:RepoRoot 'src\McpCli\bin\Release\net10.0\mcp-cli.exe')
+        Test-Path -LiteralPath $cliPath | Should -BeTrue
+    }
+
+    It 'uses the local .NET CLI without looking up or installing Bun' {
+        Mock Find-DotNetMcpCli { return 'fixture-dotnet-cli' }
+        Mock Find-McpCli { throw 'Bun lookup must not run for the .NET backend.' }
+        Mock Get-Command { throw 'Bun lookup must not run for the .NET backend.' } -ParameterFilter { $Name -eq 'bun' }
+        Mock Invoke-RestMethod { throw 'Network access must not run for the .NET backend.' }
+
+        Get-McpCliExecutable -Backend 'dotnet' | Should -Be 'fixture-dotnet-cli'
+
+        Should -Invoke Find-DotNetMcpCli -Times 1 -Exactly -Scope It
+        Should -Invoke Find-McpCli -Times 0 -Exactly -Scope It
+        Should -Invoke Invoke-RestMethod -Times 0 -Exactly -Scope It
+    }
+
+    It 'uses the Bun CLI only when the Bun backend is selected' {
+        Mock Find-McpCli { return 'fixture-bun-cli' }
+        Mock Find-DotNetMcpCli { throw 'The .NET build must not run for the Bun backend.' }
+
+        Get-McpCliExecutable -Backend 'bun' | Should -Be 'fixture-bun-cli'
+
+        Should -Invoke Find-McpCli -Times 1 -Exactly -Scope It
+        Should -Invoke Find-DotNetMcpCli -Times 0 -Exactly -Scope It
+    }
+
     It 'initializes generic commands without Agency (Agency path: <AgencySetting>)' -ForEach @(
         @{ AgencySetting = 'absent' }
         @{ AgencySetting = 'preserved' }
@@ -93,6 +135,7 @@ Describe 'MCP CLI initializer helpers' {
 
         $updated = Get-Content -Raw -LiteralPath $script:ConfigPath | ConvertFrom-Json -AsHashtable
         $updated.mcp_cli_path | Should -Be ([IO.Path]::GetFullPath($script:McpCliPath))
+        $updated.mcp_cli_backend | Should -Be 'dotnet'
         if ($AgencySetting -eq 'preserved') {
             $updated.agency_path | Should -Be 'unused-local-agency'
         }
@@ -129,13 +172,24 @@ Describe 'MCP CLI initializer helpers' {
 
         $updated = Get-Content -Raw -LiteralPath $script:ConfigPath | ConvertFrom-Json -AsHashtable
         $updated.mcp_cli_path | Should -Be ([IO.Path]::GetFullPath($script:McpCliPath))
+        $updated.mcp_cli_backend | Should -Be 'dotnet'
         $updated.agency_path | Should -Be ([IO.Path]::GetFullPath($script:AgencyPath))
         Should -Invoke Find-Agency -Times 1 -Exactly -Scope It
         Test-Path "$($script:ConfigPath).tmp" | Should -BeFalse
     }
 
+    It 'persists an explicitly selected Bun backend with its resolved executable' {
+        & $script:WriteConfig @{ mcp_cli_backend = 'dotnet'; servers = @{} }
+
+        Initialize-ConfiguredToolPaths -McpCliPath $script:McpCliPath -McpCliBackend 'bun' -ConfigPath $script:ConfigPath
+
+        $updated = Get-Content -Raw -LiteralPath $script:ConfigPath | ConvertFrom-Json -AsHashtable
+        $updated.mcp_cli_backend | Should -Be 'bun'
+        $updated.mcp_cli_path | Should -Be ([IO.Path]::GetFullPath($script:McpCliPath))
+    }
+
     It 'keeps an already-current generic configuration byte-for-byte unchanged' {
-        & $script:WriteConfig @{ mcp_cli_path = $script:McpCliPath; servers = @{} }
+        & $script:WriteConfig @{ mcp_cli_path = $script:McpCliPath; mcp_cli_backend = 'dotnet'; servers = @{} }
         $original = Get-Content -Raw -LiteralPath $script:ConfigPath
 
         Initialize-ConfiguredToolPaths -McpCliPath $script:McpCliPath -ConfigPath $script:ConfigPath

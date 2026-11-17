@@ -17,8 +17,10 @@ and its local protocol test server. Do not edit generated skills.
   NuGet packages. The test projects may use pinned test-only dependencies.
 - Use MSTest for all C# tests, with Microsoft/.NET test frameworks and tooling.
   Keep the MSTest framework and adapter versions aligned.
-- Toolkit initialization, discovery, wrapper generation, and deployment still
-  use the existing CLI. Changing that integration is a separate phase.
+- Toolkit initialization, discovery, and generated wrappers use this CLI by
+  default. Keep the explicit Bun backend available and ensure the backend
+  selector does not alter generated MCP server configuration or wrapper input
+  and output behavior.
 - Preserve [third-party notices](THIRD-PARTY-NOTICES.txt), including when publishing.
 
 ## Code map

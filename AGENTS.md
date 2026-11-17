@@ -17,8 +17,9 @@ Do not edit generated skills to fix generator behavior.
 
 ## Development
 
-Use PowerShell 7 on Windows, psake 5.0.4, and Pester 5.7.1. Work on a focused
-branch or isolated worktree. Do not mix unrelated cleanup with a behavior change.
+Use PowerShell 7 on Windows, .NET 10 SDK, psake 5.0.4, and Pester 5.7.1. Work
+on a focused branch or isolated worktree. Do not mix unrelated cleanup with a
+behavior change.
 
 ```powershell
 pwsh -NoProfile -File ./init.ps1 -SkipMcpCli
@@ -26,9 +27,11 @@ pwsh -NoProfile -File ./scripts/Invoke-Tests.ps1 -Coverage
 ```
 
 The initializer may install missing PowerShell modules for the current user.
-`-SkipMcpCli` avoids installing or checking Bun, MCP CLI, and Agency. Tests must
-never require those executables, service credentials, or a local `servers.json`.
-See [Testing](docs/testing.md) for coverage scope and result files.
+`-SkipMcpCli` avoids building or checking either MCP CLI backend and Agency.
+Tests must not require Bun, the remote MCP CLI package, Agency, service
+credentials, live servers, or a local `servers.json`. The C# MSTest suite runs
+the repository's own CLI and local protocol fixtures. See
+[Testing](docs/testing.md) for coverage scope and result files.
 
 ## Safety and privacy
 

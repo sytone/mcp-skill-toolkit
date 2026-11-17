@@ -5,10 +5,19 @@ v0.3.0, pinned to commit
 [`d77672a1ce800ec3fec1f43829909badb2ffbd32`](https://github.com/philschmid/mcp-cli/commit/d77672a1ce800ec3fec1f43829909badb2ffbd32).
 The pinned CLI uses TypeScript MCP SDK 1.25.2.
 
-**This is the port phase only.** The toolkit's initializer, generated wrappers,
-discovery, and deployment have not been switched over. They still use their
-existing MCP CLI/Bun setup. Source packaging includes this directory, but does
-not build or install it.
+The toolkit uses this local CLI by default for setup, discovery, and generated
+wrappers. `mcp_cli_backend` selects `dotnet` (the default) or the legacy `bun`
+backend; `mcp_cli_path` can override the executable path for the selected
+backend. The selector and path are toolkit settings only and are excluded from
+the MCP server configuration emitted for the CLI.
+
+The .NET backend builds from this source during initialization or a toolkit
+build, so the default setup no longer downloads the upstream CLI through Bun.
+The reason for retaining Bun is migration and compatibility with users who
+need the existing implementation; selecting it preserves the prior install and
+resolution behavior. The result is a local, dependency-free-at-runtime C# CLI
+by default, while MCP server runtimes, packages, and credentials remain
+unchanged.
 
 ## Build and run
 
