@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>mcp-cli</AssemblyName>
+    <RootNamespace>McpCli</RootNamespace>
+    <Version>0.3.0</Version>
+    <Description>Local C# port of philschmid/mcp-cli</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\THIRD-PARTY-NOTICES.txt" Link="THIRD-PARTY-NOTICES.txt"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

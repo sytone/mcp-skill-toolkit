@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   offline-tests:
-    name: PowerShell 7 / Windows
+    name: PowerShell 7 + .NET 10 / Windows
     runs-on: windows-latest
     timeout-minutes: 15
     defaults:
@@ -30,7 +30,7 @@ jobs:
         run: |
           ./init.ps1 -SkipMcpCli
 
-      - name: Run offline tests and coverage
+      - name: Run offline Pester and MSTest suites with Pester coverage
         run: |
           ./scripts/Invoke-Tests.ps1 -Coverage
 

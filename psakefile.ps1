@@ -3,6 +3,7 @@ Properties {
     $OutputDir = Join-Path $PSScriptRoot 'dist'
     $McpConfigPath = '~/.config/mcp/mcp_servers.json'
     $McpCliPath = $null
+    $McpCliBackend = $null
     $SelectedServerNames = ''
     $DiscoveryTimeoutSeconds = 180
     $SkipDiscovery = $false
@@ -95,7 +96,40 @@ function New-SetupArchive {
         'tests/fixtures/servers.json',
         'tests/fixtures/fake-mcp-cli.ps1',
         'tests/fixtures/stdio-mcp-server.ps1',
-        'tests/fixtures/stdio-mcp-cli.ps1'
+        'tests/fixtures/stdio-mcp-cli.ps1',
+        'src/.gitignore',
+        'src/Directory.Build.props',
+        'src/McpCli.slnx',
+        'src/Agents.md',
+        'src/README.md',
+        'src/THIRD-PARTY-NOTICES.txt',
+        'src/McpCli/McpCli.csproj',
+        'src/McpCli/Program.cs',
+        'src/McpCli/Cli.cs',
+        'src/McpCli/CliArguments.cs',
+        'src/McpCli/CliError.cs',
+        'src/McpCli/Configuration.cs',
+        'src/McpCli/Output.cs',
+        'src/McpCli/OutputSchema.cs',
+        'src/McpCli/SchemaRegex.cs',
+        'src/McpCli/McpJson.cs',
+        'src/McpCli/McpSchema.cs',
+        'src/McpCli/Retry.cs',
+        'src/McpCli/McpConnection.cs',
+        'src/McpCli/RpcConnection.cs',
+        'src/McpCli/StdioTransport.cs',
+        'src/McpCli/HttpTransport.cs',
+        'src/McpCli/Daemon.cs',
+        'src/McpCli.Tests/McpCli.Tests.csproj',
+        'src/McpCli.Tests/TestWorkspace.cs',
+        'src/McpCli.Tests/CliTests.cs',
+        'src/McpCli.Tests/ConfigurationTests.cs',
+        'src/McpCli.Tests/TransportTests.cs',
+        'src/McpCli.Tests/DaemonTests.cs',
+        'src/McpCli.Tests/RetryTests.cs',
+        'src/McpCli.Tests/OutputSchemaTests.cs',
+        'src/McpCli.TestServer/McpCli.TestServer.csproj',
+        'src/McpCli.TestServer/Program.cs'
     )
     $archive = [IO.Compression.ZipFile]::Open($archivePath, [IO.Compression.ZipArchiveMode]::Create)
     try {
@@ -143,8 +177,65 @@ function Resolve-BuildPath {
     return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($expanded)
 }
 
+function Get-ConfiguredMcpCliBackend {
+    param([object]$ConfigObject)
+
+    foreach ($propertyName in @('mcp_cli_backend', 'mcpCliBackend')) {
+        $property = $ConfigObject.PSObject.Properties[$propertyName]
+        if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return ([string]$property.Value).Trim().ToLowerInvariant()
+        }
+    }
+
+    return 'dotnet'
+}
+
+function Resolve-McpCliBackend {
+    param(
+        [string]$RequestedBackend,
+        [object]$ConfigObject
+    )
+
+    $backend = if ([string]::IsNullOrWhiteSpace($RequestedBackend)) {
+        Get-ConfiguredMcpCliBackend -ConfigObject $ConfigObject
+    }
+    else {
+        $RequestedBackend.Trim().ToLowerInvariant()
+    }
+
+    if ($backend -notin @('dotnet', 'bun')) {
+        throw "Unsupported MCP CLI backend '$backend'. Choose 'dotnet' or 'bun'."
+    }
+
+    return $backend
+}
+
+function Resolve-DotNetMcpCliPath {
+    $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+    if ($null -eq $dotnet) {
+        throw '.NET SDK 10 is required for the dotnet MCP CLI backend. Install the SDK or select McpCliBackend=bun.'
+    }
+
+    $projectPath = Join-Path $PSScriptRoot 'src\McpCli\McpCli.csproj'
+    & $dotnet.Source build $projectPath --configuration Release --nologo | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Building the local MCP CLI failed (exit code $LASTEXITCODE)."
+    }
+
+    $cliPath = Join-Path $PSScriptRoot 'src\McpCli\bin\Release\net10.0\mcp-cli.exe'
+    if (-not (Test-Path -LiteralPath $cliPath)) {
+        throw "The local MCP CLI build succeeded but its executable was not found: $cliPath"
+    }
+
+    return (Resolve-Path -LiteralPath $cliPath).Path
+}
+
 function Resolve-McpCliPath {
-    param([string]$RequestedPath)
+    param(
+        [string]$RequestedPath,
+        [ValidateSet('dotnet', 'bun')]
+        [string]$Backend = 'dotnet'
+    )
 
     if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
         if (-not [IO.Path]::IsPathRooted($RequestedPath) -and $RequestedPath -notmatch '[\\/]') {
@@ -160,6 +251,10 @@ function Resolve-McpCliPath {
             }
         }
         Write-BuildLog "Configured mcp-cli path was not found: $RequestedPath. Trying installed locations." 'WARN'
+    }
+
+    if ($Backend -eq 'dotnet') {
+        return Resolve-DotNetMcpCliPath
     }
 
     $command = Get-Command mcp-cli -ErrorAction SilentlyContinue
@@ -1326,24 +1421,33 @@ Task Package -Description 'Package only public source, docs, example configurati
 }
 
 Task Discover -Depends Config -Description 'Discover tools for selected servers unless discovery is skipped.' {
+    $configuredBackend = Get-ConfiguredMcpCliBackend -ConfigObject $script:SourceConfigObject
+    $selectedBackend = Resolve-McpCliBackend -RequestedBackend $McpCliBackend -ConfigObject $script:SourceConfigObject
     $configuredMcpCliPath = Get-ConfiguredMcpCliPath -ConfigObject $script:SourceConfigObject
-    $effectiveMcpCliPath = if (-not [string]::IsNullOrWhiteSpace($McpCliPath)) { $McpCliPath } else { $configuredMcpCliPath }
+    $effectiveMcpCliPath = if (-not [string]::IsNullOrWhiteSpace($McpCliPath)) {
+        $McpCliPath
+    }
+    elseif ($selectedBackend -eq $configuredBackend) {
+        $configuredMcpCliPath
+    }
+    else {
+        $null
+    }
     $requestedServers = @($SelectedServerNames -split '\s*[,|]\s*' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $script:BuildServers = Get-SourceServerMap -ConfigObject $script:SourceConfigObject -SelectedServers $requestedServers
     $script:DiscoveryResults = @{}
-    $script:ScriptMcpCliPath = if (-not [string]::IsNullOrWhiteSpace($effectiveMcpCliPath)) { $effectiveMcpCliPath } else { 'mcp-cli' }
-
     if ($script:BuildServers.Count -eq 0) {
         Write-BuildLog 'No selected servers to build.' 'SKIP'
         return
     }
 
+    $script:McpCli = Resolve-McpCliPath -RequestedPath $effectiveMcpCliPath -Backend $selectedBackend
+    $script:ScriptMcpCliPath = $script:McpCli
+
     if ([bool]$SkipDiscovery) {
         Write-BuildLog 'Live discovery skipped.' 'SKIP'
     }
     else {
-        $script:McpCli = Resolve-McpCliPath -RequestedPath $effectiveMcpCliPath
-        $script:ScriptMcpCliPath = $script:McpCli
         Write-BuildLog "Using mcp-cli: $script:McpCli"
     }
 
@@ -1413,25 +1517,43 @@ Task GenerateSkills -Depends Discover -Description 'Generate skill packages from
 
 Task Build -Depends GenerateSkills -Description 'Generate configuration and skill packages.'
 
-Task Test -Description 'Run the Pester test suite.' {
+Task Test -Description 'Run the Pester and MSTest suites.' {
     if (-not @(Get-Module -ListAvailable -Name Pester | Where-Object Version -eq ([version]'5.7.1')).Count) {
         throw 'Pester 5.7.1 not found. Run init.ps1 and retry.'
     }
+    if ($null -eq (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        throw '.NET SDK 10 is required to run the local MCP CLI MSTest suite.'
+    }
 
-    # Pester versions load conflicting assemblies. Use a fresh process so the
-    # pinned runner also works when a different Pester is already imported.
+    # Pester versions load conflicting assemblies. Use a fresh process for the
+    # configured Pester path, then run the colocated C# suite as well.
     $previousTestPath = $env:MCP_SKILL_TOOLKIT_TEST_PATH
-    $testCommand = '$ErrorActionPreference = ''Stop''; Import-Module psake -RequiredVersion 5.0.4; Import-Module Pester -RequiredVersion 5.7.1; $results = Invoke-Pester -Path $env:MCP_SKILL_TOOLKIT_TEST_PATH -Output Detailed -PassThru; if ($results.FailedCount -gt 0 -or $results.TotalCount -eq 0) { exit 1 }'
+    $previousTestSolution = $env:MCP_SKILL_TOOLKIT_TEST_SOLUTION
+    $testCommand = @'
+$ErrorActionPreference = 'Stop'
+Import-Module psake -RequiredVersion 5.0.4 -Force
+Import-Module Pester -RequiredVersion 5.7.1 -Force
+$results = Invoke-Pester -Path $env:MCP_SKILL_TOOLKIT_TEST_PATH -Output Detailed -PassThru
+if ($results.FailedCount -gt 0 -or $results.TotalCount -eq 0) {
+    exit 1
+}
+& dotnet test $env:MCP_SKILL_TOOLKIT_TEST_SOLUTION --configuration Release
+if ($LASTEXITCODE -ne 0) {
+    exit 1
+}
+'@
     try {
         $env:MCP_SKILL_TOOLKIT_TEST_PATH = Resolve-BuildPath -Path $TestPath
+        $env:MCP_SKILL_TOOLKIT_TEST_SOLUTION = Join-Path $PSScriptRoot 'src\McpCli.slnx'
         $executableName = if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }
         & (Join-Path $PSHOME $executableName) -NoLogo -NoProfile -NonInteractive -Command $testCommand
         if ($LASTEXITCODE -ne 0) {
-            throw "Pester test process failed (exit code $LASTEXITCODE)."
+            throw "Test process failed (exit code $LASTEXITCODE)."
         }
     }
     finally {
         $env:MCP_SKILL_TOOLKIT_TEST_PATH = $previousTestPath
+        $env:MCP_SKILL_TOOLKIT_TEST_SOLUTION = $previousTestSolution
     }
 }
 

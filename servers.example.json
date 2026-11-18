@@ -1,5 +1,5 @@
 {
-  "mcp_cli_path": "mcp-cli",
+  "mcp_cli_backend": "dotnet",
   "servers": {
     "everything": {
       "command": [

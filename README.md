@@ -27,8 +27,10 @@ in each skill's `references/custom-instructions.md`.
 
 - PowerShell 7. Windows is the tested host.
 - psake 5.0.4 and Pester 5.7.1 for builds and tests.
-- MCP CLI for live discovery and tool calls. The initializer can install it
-  using Bun.
+- .NET 10 SDK for the default MCP CLI backend and the C# test suite. The SDK
+  builds the local CLI; the .NET runtime is needed to run its framework-
+  dependent executable.
+- Bun only if you explicitly select the legacy Bun backend.
 - The runtime and credentials required by the MCP servers you choose.
 - Agency only if your enabled server configuration uses it.
 
@@ -36,6 +38,34 @@ The example uses the public
 [Everything test server](https://github.com/modelcontextprotocol/servers/tree/main/src/everything),
 not a production service. Its Windows command requires Node.js and `npx`.
 No server runtime is required for an offline build.
+
+## MCP CLI backends
+
+The local C# port of MCP CLI v0.3.0 under [src/](src/README.md) is the default.
+`init.ps1` builds it from source, and discovery plus generated wrappers use
+that executable. This removes the Bun/npm download of MCP CLI from the default
+workflow; it does not remove runtimes or credentials needed by MCP servers.
+
+The legacy Bun CLI remains available by setting the top-level
+`mcp_cli_backend` field in `servers.json` to `"bun"`, or by selecting
+`McpCliBackend = 'bun'` for a psake build. `McpCliPath` (build property) and
+`mcp_cli_path` (config field) can override the executable path for the selected
+backend. If an older config points at Bun, set `mcp_cli_backend` to `"bun"` to
+keep using it; run `init.ps1` with the desired backend to update the saved local
+path. The backend selector is toolkit metadata and is not copied into the MCP
+server configuration passed to the CLI.
+
+The .NET backend builds during `init.ps1` and when needed by a build, so
+`-SkipMcpCli` still skips both CLI setup and CLI checks for dependency-only
+initialization. The `dotnet` backend requires the .NET 10 SDK to build and the
+.NET runtime to run. The optional Bun backend retains its existing Bun and
+remote-package installation behavior.
+
+| Choice | Why it exists | Outcome |
+| --- | --- | --- |
+| .NET backend (default) | Use the in-repository port instead of downloading MCP CLI through Bun. | Local executable; requires .NET 10 SDK/runtime; server commands and generated skill interfaces stay the same. |
+| Bun backend | Preserve compatibility for users who choose the existing CLI. | Existing Bun installation and remote package resolution remain in effect. |
+| `mcp_cli_path` override | Support an explicit executable location. | The build invokes that path; initialization refreshes the saved path for the selected backend. |
 
 ## Quick start
 
@@ -51,7 +81,7 @@ Review `servers.json` before running anything. Server commands are executable
 configuration. An `npx -y` entry downloads and runs a package during live
 discovery; use only packages and servers you trust.
 
-Initialize the build dependencies without installing or checking external CLIs:
+Initialize PowerShell dependencies without building or checking either CLI:
 
 ```powershell
 pwsh -NoProfile -File ./init.ps1 -SkipMcpCli
@@ -71,12 +101,21 @@ if (-not $psake.build_success) { throw 'Build failed.' }
 This creates `SKILL.md`, tool references, and a generic runner. Offline builds
 do not discover tool names and therefore do not create per-tool wrappers.
 
-For live discovery, install or verify the external CLIs, then build:
+For live discovery, initialize the default local .NET CLI, then build:
 
 ```powershell
 pwsh -NoProfile -File ./init.ps1
 Invoke-psake -TaskList Build
 if (-not $psake.build_success) { throw 'Build failed.' }
+```
+
+To keep using the legacy Bun CLI, set `"mcp_cli_backend": "bun"` in
+`servers.json` before initialization, or use `-McpCliBackend bun` with
+`init.ps1`. The initializer saves the selected backend and resolved executable
+path in the local config. A psake build can also override the config setting:
+
+```powershell
+Invoke-psake -TaskList Build -Properties @{ McpCliBackend = 'bun' }
 ```
 
 The default build writes MCP CLI configuration to
@@ -283,4 +322,5 @@ scripts/Invoke-Tests.ps1    Shared local/CI test runner
 scripts/Invoke-McpStdioBridge.ps1  Source for the generated stdio transport helper
 .github/workflows/         GitHub Actions workflow
 tests/                     Offline Pester tests and fixtures
+src/                       Standalone C# MCP CLI port, tests, and local test server
 ```
