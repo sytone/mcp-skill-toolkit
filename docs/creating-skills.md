@@ -47,6 +47,99 @@ The optional `tool_policy` object accepts `allow` and `deny` arrays, which map
 to MCP CLI's `allowedTools` and `disabledTools` configuration. Tool filtering
 is not a replacement for service-side permissions.
 
+### Elicitation and approval defaults (.NET backend)
+
+The optional per-server `elicitation` object enables MCP `elicitation/create`
+form requests. It is not enabled globally or inferred from tool descriptions.
+For servers such as Computer Use, prefer this default:
+
+```json
+"elicitation": { "action": "ask" }
+```
+
+In `ask` mode, the script returns exit code **4** and a JSON object such as:
+
+```json
+{
+  "status": "approval_required",
+  "approvalId": "<single-use-id>",
+  "server": "my-tools",
+  "tool": "my-tool",
+  "request": {
+    "message": "Approve this operation?",
+    "requestedSchema": {
+      "type": "object",
+      "properties": { "approved": { "type": "boolean" } },
+      "required": ["approved"]
+    }
+  }
+}
+```
+
+The agent must present the request to the user, obtain their answer, and resume
+the **same pending call** through the same script:
+
+```powershell
+pwsh -NoProfile -File './dist/skills/my-tools/scripts/my-tool.ps1' `
+    -ApprovalId '<returned-id>' -ApprovalAction accept `
+    -ApprovalJson '{"approved":true}'
+# Or refuse/cancel without form content:
+pwsh -NoProfile -File './dist/skills/my-tools/scripts/my-tool.ps1' `
+    -ApprovalId '<returned-id>' -ApprovalAction decline
+```
+
+These are illustrative form fields, not a claim about a particular server's
+approval schema. Supply the actual answers required by `request.requestedSchema`;
+do not invent an `approved` property or infer permission from a tool result.
+The generic runner accepts the same approval parameters plus `-Tool`.
+`-ApprovalAction` defaults to `accept` when an ID is supplied; `-ApprovalJson`
+defaults to `{}`. Invalid/mismatched content sends no approval and leaves the ID
+available for a corrected response until expiry.
+
+The cached worker retains the MCP connection and original tool execution;
+approving does **not** call the tool again. Each approval ID is valid once, for
+that server configuration, tool, CLI installation, and working directory.
+Further requests can return new IDs. `MCP_TIMEOUT` bounds the original retained
+call, including time spent waiting for the user (default 1800 seconds). Pending
+calls prevent idle shutdown but not that deadline. Expired, lost, or already-used
+IDs fail explicitly and never start a replacement worker or replay a call.
+Only one tool call may be active on an `ask` server at a time; a new call is
+rejected while the existing call runs or awaits approval. Tool retries are
+disabled in this mode. `MCP_NO_DAEMON=1` is incompatible with `ask`.
+
+For explicitly authorized unattended use, a server can instead set a default
+response:
+
+```json
+"elicitation": {
+  "action": "accept",
+  "content": { "approved": true }
+}
+```
+
+**This opts that server into automatically answering every compatible form
+request, including approval requests.** Use it only for a trusted server and a
+deliberately authorized scope. `content` is a flat object of strings, numbers,
+booleans, or string arrays. Accepted answers must satisfy the server's schema;
+unknown answer fields are rejected, and required fields are never fabricated or
+filled from defaults. An omitted `content` means `{}`, not blanket agreement
+with every possible form. `decline` and `cancel` defaults are also supported,
+without `content`. `ask` cannot have default content.
+
+With no `elicitation` field, the client retains its old behavior: no elicitation
+capability and method-not-found responses. Enabled policies advertise form
+support only; URL-mode requests are rejected and no browser is opened.
+The legacy Bun backend does not implement these policies, so the generator
+rejects enabled-server elicitation configuration when Bun is selected.
+Custom CLI overrides must point to a compatible build.
+
+Approval needs are normally known only at runtime. MCP tool discovery lists
+tool schemas and annotations, not whether a particular call will elicit
+consent. Discovery never probes tools to trigger approvals. This supports the
+standard protocol path but is not a guarantee of live Computer Use compatibility
+or a replacement for its native permissions, interruption, or action policies.
+Regenerate previously generated scripts before using approval parameters.
+
 ## 2. Generate offline first
 
 ```powershell

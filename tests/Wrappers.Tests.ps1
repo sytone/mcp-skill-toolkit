@@ -404,7 +404,10 @@ exit $LASTEXITCODE
         $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $script:WrappersScripts '_valid-tool.ps1'), [ref]$tokens, [ref]$errors)
         $errors.Count | Should -Be 0
         $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-        $parameterNames.Count | Should -Be 3
+        $parameterNames.Count | Should -Be 6
+        $parameterNames | Should -Contain 'ApprovalId'
+        $parameterNames | Should -Contain 'ApprovalAction'
+        $parameterNames | Should -Contain 'ApprovalJson'
         $parameterNames | Should -Contain 'Json'
         $parameterNames | Should -Contain 'JsonPath'
         $parameterNames | Should -Contain 'Text'

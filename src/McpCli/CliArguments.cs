@@ -3,7 +3,8 @@ using System.Text.RegularExpressions;
 namespace McpCli;
 
 public sealed record CliArguments(string Command, string? Server = null, string? Tool = null,
-    string? Pattern = null, string? Json = null, bool WithDescriptions = false, string? ConfigPath = null)
+    string? Pattern = null, string? Json = null, bool WithDescriptions = false, string? ConfigPath = null,
+    string? ApprovalId = null, string? ApprovalAction = null)
 {
     public static CliArguments Parse(string[] args)
     {
@@ -31,6 +32,18 @@ public sealed record CliArguments(string Command, string? Server = null, string?
             string? pattern = null, string? json = null) => new(command, server, tool, pattern, json, descriptions, config);
         if (positional.Count == 0) return Result("list");
         var first = positional[0];
+        if (first == "approve")
+        {
+            if (positional.Count < 5) throw CliError.Missing("approve", "server, tool, approval ID, and action");
+            if (positional.Count > 6)
+                throw new CliError(1, "TOO_MANY_ARGUMENTS", "Too many arguments for approve");
+            if (positional[4] is not ("accept" or "decline" or "cancel"))
+                throw new CliError(1, "INVALID_APPROVAL_ACTION", "Approval action must be accept, decline, or cancel");
+            if (!Guid.TryParseExact(positional[3], "N", out _))
+                throw new CliError(1, "INVALID_APPROVAL_ID", "Approval ID must be the exact ID returned by the pending call");
+            return new("approve", positional[1], positional[2], Json: positional.ElementAtOrDefault(5),
+                ConfigPath: config, ApprovalId: positional[3], ApprovalAction: positional[4]);
+        }
         if (first == "grep")
         {
             if (positional.Count < 2 || positional[1].Length == 0) throw CliError.Missing("grep", "pattern");

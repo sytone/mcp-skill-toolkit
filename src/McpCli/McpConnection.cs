@@ -20,6 +20,12 @@ public sealed class McpConnection(RpcConnection rpc, ServerConfig config, Runtim
     public static async Task<IMcpConnection> ConnectAsync(string name, ServerConfig config,
         RuntimeSettings settings, CancellationToken cancellationToken)
     {
+        if (config.Elicitation?.Action == "ask")
+        {
+            if (!settings.DaemonEnabled)
+                throw new InvalidOperationException("Elicitation ask mode requires cached workers; unset MCP_NO_DAEMON");
+            return await Daemon.ConnectAsync(name, config, settings, cancellationToken);
+        }
         if (settings.DaemonEnabled)
         {
             try
@@ -38,11 +44,11 @@ public sealed class McpConnection(RpcConnection rpc, ServerConfig config, Runtim
     }
 
     public static Task<McpConnection> ConnectDirectAsync(string name, ServerConfig config,
-        RuntimeSettings settings, CancellationToken cancellationToken) =>
+        RuntimeSettings settings, CancellationToken cancellationToken, ElicitationBroker? approvals = null) =>
         Retry.RunAsync(async token =>
         {
             var rpc = new RpcConnection(config.IsHttp ? new HttpTransport(config, settings) :
-                new StdioTransport(name, config, settings), settings);
+                new StdioTransport(name, config, settings), settings, config.Elicitation, approvals);
             try
             {
                 await rpc.InitializeAsync(token);

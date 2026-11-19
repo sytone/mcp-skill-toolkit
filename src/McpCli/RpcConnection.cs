@@ -29,6 +29,8 @@ public sealed class RpcConnection : IAsyncDisposable
 {
     private readonly RpcTransport transport;
     private readonly RuntimeSettings settings;
+    private readonly ElicitationPolicy? elicitation;
+    private readonly ElicitationBroker? approvals;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonNode?>> pending = new();
     private long nextId;
     private Exception? failure;
@@ -38,10 +40,13 @@ public sealed class RpcConnection : IAsyncDisposable
     public static readonly string[] SupportedVersions =
         ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
 
-    public RpcConnection(RpcTransport transport, RuntimeSettings settings)
+    public RpcConnection(RpcTransport transport, RuntimeSettings settings, ElicitationPolicy? elicitation = null,
+        ElicitationBroker? approvals = null)
     {
         this.transport = transport;
         this.settings = settings;
+        this.elicitation = elicitation;
+        this.approvals = approvals;
         transport.ReceiveAsync = ReceiveAsync;
         transport.Failed = Fail;
     }
@@ -52,7 +57,8 @@ public sealed class RpcConnection : IAsyncDisposable
         var result = await RequestAsync("initialize", new JsonObject
         {
             ["protocolVersion"] = SupportedVersions[0],
-            ["capabilities"] = new JsonObject(),
+            ["capabilities"] = elicitation is null ? new JsonObject() :
+                new JsonObject { ["elicitation"] = new JsonObject { ["form"] = new JsonObject() } },
             ["clientInfo"] = new JsonObject { ["name"] = "mcp-cli", ["version"] = Cli.Version }
         }, cancellationToken);
         if (result is not JsonObject obj || obj["protocolVersion"] is not JsonValue version ||
@@ -120,6 +126,32 @@ public sealed class RpcConnection : IAsyncDisposable
             {
                 var response = new JsonObject { ["jsonrpc"] = "2.0", ["id"] = requestId.DeepClone() };
                 if (method.ToString() == "ping") response["result"] = new JsonObject();
+                else if (method.ToString() == "elicitation/create" && elicitation is not null)
+                {
+                    try
+                    {
+                        if (elicitation.Action == "ask")
+                        {
+                            if (approvals is null)
+                                throw new McpException(-32603, "Ask-mode elicitation requires a cached worker");
+                            approvals.Request(message["params"], async (result, token) =>
+                            {
+                                await transport.SendAsync(new JsonObject
+                                {
+                                    ["jsonrpc"] = "2.0", ["id"] = requestId.DeepClone(), ["result"] = result
+                                }, token);
+                            });
+                            return;
+                        }
+                        response["result"] = elicitation.Respond(message["params"]);
+                        settings.Diagnostics($"[mcp-cli] Elicitation: configured unattended action '{elicitation.Action}'.");
+                    }
+                    catch (McpException rejection)
+                    {
+                        response["error"] = new JsonObject { ["code"] = rejection.Code, ["message"] = rejection.Message };
+                        settings.Diagnostics($"[mcp-cli] Elicitation rejected: {rejection.Message}");
+                    }
+                }
                 else response["error"] = new JsonObject { ["code"] = -32601, ["message"] = "Method not found" };
                 await transport.SendAsync(response, cancellationToken);
             }

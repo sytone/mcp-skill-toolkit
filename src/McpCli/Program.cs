@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.IO.Pipes;
 using System.Text;
 using System.Text.Json.Nodes;
 using McpCli;
@@ -16,6 +17,11 @@ using var terminate = !OperatingSystem.IsWindows() ? PosixSignalRegistration.Cre
     cancellation.Cancel();
 }) : null;
 var settings = new RuntimeSettings();
+if (args.Length > 0 && args[0] == "--daemon-pipe")
+{
+    try { return await RunPipeWorkerAsync(); }
+    catch (Exception error) { Console.Error.WriteLine($"Daemon failed: {error.Message}"); return 1; }
+}
 if (args.Length > 0 && args[0] == "--daemon")
 {
     try
@@ -32,6 +38,48 @@ var result = await Cli.RunAsync(args, Console.In, Console.Out, Console.Error, Co
     !Console.IsOutputRedirected && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NO_COLOR")),
     settings, cancellation.Token);
 return cancellation.IsCancellationRequested ? signalExitCode : result;
+
+async Task<int> RunPipeWorkerAsync()
+{
+    if (args.Length != 3 || !args[1].StartsWith("mcp-cli-startup-", StringComparison.Ordinal) ||
+        !Guid.TryParseExact(args[1]["mcp-cli-startup-".Length..], "N", out _))
+        throw new InvalidDataException("Invalid daemon startup pipe");
+    await using var pipe = new NamedPipeClientStream(".", args[1], PipeDirection.InOut,
+        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+    using var startup = CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token);
+    startup.CancelAfter(5000);
+    await pipe.ConnectAsync(startup.Token);
+    using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
+    var ready = false;
+    void WriteStartupLine(string message)
+    {
+        lock (pipe) pipe.Write(Encoding.UTF8.GetBytes(message + "\n"));
+    }
+    settings.Diagnostics = message =>
+    {
+        WriteStartupLine(McpJson.Serialize(new JsonObject { ["diagnostic"] = message }));
+    };
+    try
+    {
+        var value = McpJson.Parse(await reader.ReadLineAsync(startup.Token) ?? "") as JsonObject ??
+            throw new InvalidDataException("Invalid daemon configuration");
+        Configuration.ValidateServer(args[2], value);
+        var config = new ServerConfig(value);
+        return await Daemon.RunAsync(Daemon.PipeName(args[2], config, settings), args[2], config,
+            settings, cancellation.Token, () =>
+            {
+                WriteStartupLine("DAEMON_READY");
+                ready = true;
+                pipe.Dispose();
+            });
+    }
+    catch (Exception error)
+    {
+        if (!ready) settings.Diagnostics($"Daemon failed: {error.Message}");
+        else Console.Error.WriteLine($"Daemon failed: {error.Message}");
+        return 1;
+    }
+}
 
 internal static class StandardHandles
 {

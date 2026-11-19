@@ -19,6 +19,11 @@ if (args.FirstOrDefault() != "http")
 {
     var session = new FakeSession();
     var responses = new List<Task>();
+    var callbacks = Task.Run(async () =>
+    {
+        await foreach (var message in session.Responses.Reader.ReadAllAsync())
+            Console.WriteLine(FixtureJson.Serialize(message));
+    });
     if (Environment.GetEnvironmentVariable("FAKE_STDOUT_PREFIX") is { } prefix) Console.WriteLine(prefix);
     while (await Console.In.ReadLineAsync() is { } line)
     {
@@ -34,6 +39,8 @@ if (args.FirstOrDefault() != "http")
         responses.Add(RespondAsync(request));
     }
     await Task.WhenAll(responses);
+    session.Responses.Writer.TryComplete();
+    await callbacks;
     return;
 
     async Task RespondAsync(JsonObject request)
@@ -210,6 +217,8 @@ internal sealed class FakeSession
     public string Version { get; } = Environment.GetEnvironmentVariable("FAKE_PROTOCOL") ?? "2025-11-25";
     private static readonly SemaphoreSlim LogLock = new(1);
     private readonly ConcurrentDictionary<string, CancellationTokenSource> pending = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonObject>> elicitations = new();
+    private JsonObject clientCapabilities = new();
     public Channel<JsonObject> Responses { get; } = Channel.CreateUnbounded<JsonObject>();
 
     public static async Task LogAsync(string path, JsonObject entry)
@@ -224,6 +233,12 @@ internal sealed class FakeSession
         if (Environment.GetEnvironmentVariable("FAKE_REQUEST_LOG") is { } path)
             await LogAsync(path, request);
         var method = request["method"]?.ToString();
+        if (method is null && request["id"] is { } replyId &&
+            elicitations.TryRemove(replyId.ToJsonString(), out var reply))
+        {
+            reply.TrySetResult(request);
+            return null;
+        }
         if (method == "notifications/cancelled")
         {
             if (request["params"]?["requestId"] is { } id && pending.TryGetValue(id.ToJsonString(), out var cancellation))
@@ -235,6 +250,7 @@ internal sealed class FakeSession
         JsonNode result;
         if (method == "initialize")
         {
+            clientCapabilities = request["params"]?["capabilities"]?.DeepClone().AsObject() ?? new();
             if (int.TryParse(Environment.GetEnvironmentVariable("FAKE_INIT_DELAY"), out var delay)) await Task.Delay(delay);
             result = new JsonObject
             {
@@ -269,6 +285,7 @@ internal sealed class FakeSession
                 tools.Add(tool);
             }
             result = new JsonObject { ["tools"] = tools, ["nextCursor"] = "upstream-only-reads-first-page" };
+            if (Environment.GetEnvironmentVariable("FAKE_NO_NEXT_CURSOR") == "1") result.AsObject().Remove("nextCursor");
         }
         else if (method == "tools/call")
         {
@@ -279,6 +296,28 @@ internal sealed class FakeSession
                 return Result(request, FixtureJson.Parse(toolResult)!);
             switch (name)
             {
+                case "elicit":
+                    JsonObject? approval = null;
+                    var count = int.TryParse(Environment.GetEnvironmentVariable("FAKE_ELICIT_COUNT"), out var configuredCount) ?
+                        configuredCount : 1;
+                    for (var index = 0; index < count; index++)
+                    {
+                        var elicitationId = JsonValue.Create("approval-" + Guid.NewGuid().ToString("N"))!;
+                        var answer = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        elicitations[elicitationId.ToJsonString()] = answer;
+                        Responses.Writer.TryWrite(new JsonObject
+                        {
+                            ["jsonrpc"] = "2.0", ["id"] = elicitationId.DeepClone(),
+                            ["method"] = "elicitation/create", ["params"] = arguments?.DeepClone()
+                        });
+                        approval = await answer.Task.WaitAsync(TimeSpan.FromSeconds(15));
+                    }
+                    result = Text(new JsonObject
+                    {
+                        ["capabilities"] = clientCapabilities.DeepClone(), ["response"] = approval?.DeepClone(),
+                        ["pid"] = Environment.ProcessId, ["calls"] = calls
+                    }.ToJsonString());
+                    break;
                 case "error_code_text":
                     if (calls == 1) return Error(request, "EPIPE while validating input");
                     result = Text("unexpected retry");

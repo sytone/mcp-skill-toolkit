@@ -143,6 +143,39 @@ Describe 'Build source unit behavior' {
     }
 
     Context 'MCP CLI configuration conversion' {
+        It 'forwards explicit elicitation defaults for stdio and HTTP without enabling unconfigured servers' {
+            $config = @'
+{"servers":{"stdio":{"command":["offline"],"transport":"stdio","elicitation":{"action":"accept","content":{"approved":true}}},
+"http":{"command":["offline"],"transport":"http","elicitation":{"action":"ask"}},"plain":{"command":["offline"]}}}
+'@ | ConvertFrom-Json
+            $result = ConvertTo-McpCliConfig -ConfigObject $config
+            $result.mcpServers.stdio.elicitation.action | Should -BeExactly 'accept'
+            $result.mcpServers.stdio.elicitation.content.approved | Should -BeTrue
+            $result.mcpServers.http.elicitation.action | Should -BeExactly 'ask'
+            $result.mcpServers.plain.Contains('elicitation') | Should -BeFalse
+        }
+
+        It 'rejects malformed or ambiguous elicitation policies: <Policy>' -ForEach @(
+            @{ Policy = 'null' }
+            @{ Policy = 'true' }
+            @{ Policy = '{}' }
+            @{ Policy = '{"action":"ACCEPT"}' }
+            @{ Policy = '{"action":"accept","contents":{}}' }
+            @{ Policy = '{"action":"cancel","content":{}}' }
+            @{ Policy = '{"action":"ask","content":{}}' }
+            @{ Policy = '{"action":"accept","content":[]}' }
+        ) {
+            $config = ('{"servers":{"offline":{"command":["offline"],"elicitation":' + $Policy + '}}}') | ConvertFrom-Json
+            { ConvertTo-McpCliConfig -ConfigObject $config } | Should -Throw "*Server 'offline': elicitation*"
+        }
+
+        It 'rejects Bun elicitation unless the effective build backend overrides it to dotnet' {
+            $config = '{"mcp_cli_backend":"bun","servers":{"offline":{"command":["offline"],"elicitation":{"action":"ask"}}}}' | ConvertFrom-Json
+            { ConvertTo-McpCliConfig -ConfigObject $config } | Should -Throw '*requires the dotnet*'
+            (ConvertTo-McpCliConfig -ConfigObject $config -Backend dotnet).mcpServers.offline.elicitation.action |
+                Should -BeExactly 'ask'
+        }
+
         It 'converts stdio commands and expands both port placeholders including the default port' {
             $config = [pscustomobject]@{ servers = [pscustomobject]@{
                 explicit = [pscustomobject]@{

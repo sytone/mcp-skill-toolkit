@@ -50,6 +50,8 @@ public sealed record ServerConfig(JsonObject Value)
     public string[] Args => Strings("args");
     public string[] AllowedTools => Strings("allowedTools");
     public string[] DisabledTools => Strings("disabledTools");
+    public ElicitationPolicy? Elicitation => Value.ContainsKey("elicitation") ?
+        ElicitationPolicy.Parse(Value["elicitation"]) : null;
 
     public string[] Strings(string property) => Value[property] is JsonArray array ?
         array.Select(n => n!.GetValue<string>()).ToArray() : [];
@@ -156,6 +158,14 @@ public static class Configuration
                 throw InvalidServer(name, $"Invalid server configuration for \"{name}\"", $"{field} must be an object of strings");
         if (server.ContainsKey("cwd") && !IsString(server["cwd"]))
             throw InvalidServer(name, $"Invalid server configuration for \"{name}\"", "cwd must be a string");
+        if (server.ContainsKey("elicitation"))
+        {
+            try { ElicitationPolicy.Parse(server["elicitation"]); }
+            catch (InvalidDataException error)
+            {
+                throw InvalidServer(name, $"Invalid server configuration for \"{name}\"", error.Message);
+            }
+        }
     }
 
     private static bool IsString(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out _);
