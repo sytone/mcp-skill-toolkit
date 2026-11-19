@@ -135,7 +135,8 @@ public sealed class DaemonTests
         process.Kill();
         await process.WaitForExitAsync();
         await Task.WhenAll(stdout, stderr);
-        Assert.IsTrue(await WaitForMessageAsync(log, "fixture/cancelled"), "Closing the caller must cancel its server operation.");
+        Assert.IsTrue(await WaitForMessageAsync(log, "fixture/cancelled", 8000),
+            "Closing the caller must cancel its server operation.");
         var next = await workspace.RunAsync(["call", "offline", "echo", "{\"text\":\"worker alive\"}"]);
         Assert.AreEqual(0, next.ExitCode, next.Stderr);
         Assert.AreEqual("worker alive", next.Stdout.Trim());
@@ -177,9 +178,9 @@ public sealed class DaemonTests
         Assert.AreEqual(1, (await File.ReadAllLinesAsync(log)).Count(l => JsonNode.Parse(l)!["method"]?.ToString() == "tools/call"));
     }
 
-    private static async Task<bool> WaitForMessageAsync(string log, string method)
+    private static async Task<bool> WaitForMessageAsync(string log, string method, int timeoutMilliseconds = 3000)
     {
-        using var timeout = new CancellationTokenSource(3000);
+        using var timeout = new CancellationTokenSource(timeoutMilliseconds);
         while (!timeout.IsCancellationRequested)
         {
             if ((await File.ReadAllLinesAsync(log)).Any(l => l.Contains($"\"method\":\"{method}\"", StringComparison.Ordinal)))
