@@ -90,10 +90,11 @@ public sealed class DaemonTests
         await workspace.WriteConfigAsync(("offline", server));
         workspace.EnvironmentVariables["MCP_NO_DAEMON"] = "0";
         workspace.EnvironmentVariables["MCP_DAEMON_TIMEOUT"] = "15";
+        workspace.EnvironmentVariables["MCP_DEBUG"] = "1";
         workspace.TrackDaemon("offline", server);
         var results = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ =>
             workspace.RunAsync(["call", "offline", "state", "{}"])));
-        foreach (var result in results) Assert.AreEqual(0, result.ExitCode);
+        foreach (var result in results) Assert.AreEqual(0, result.ExitCode, result.Stderr);
         Assert.AreEqual(1, results.Select(r => JsonNode.Parse(r.Stdout)!["pid"]!.ToString()).Distinct().Count());
     }
 

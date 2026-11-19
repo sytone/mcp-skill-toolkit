@@ -58,6 +58,19 @@ public sealed class TestWorkspace : IAsyncDisposable
         var start = ProcessInfo(CliPath);
         if (withConfig) { start.ArgumentList.Add("-c"); start.ArgumentList.Add(ConfigPath); }
         foreach (var argument in arguments) start.ArgumentList.Add(argument);
+        return Start(start);
+    }
+
+    public Process StartPowerShell(string script, params string[] arguments)
+    {
+        var start = ProcessInfo("pwsh");
+        foreach (var argument in new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script }.Concat(arguments))
+            start.ArgumentList.Add(argument);
+        return Start(start);
+    }
+
+    private Process Start(ProcessStartInfo start)
+    {
         foreach (var (name, value) in EnvironmentVariables)
         {
             if (value is null) start.Environment.Remove(name);

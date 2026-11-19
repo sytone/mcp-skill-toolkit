@@ -63,6 +63,7 @@ exit $LASTEXITCODE
                         env = @{ MCP_BRIDGE_TEST_VALUE = $text }
                         allowedTools = @('echo')
                         disabledTools = @('delete_*')
+                        elicitation = @{ action = 'ask' }
                     }
                     untouched = @{ url = 'http://127.0.0.1:1/not-contacted'; headers = @{ Example = 'not-a-secret' } }
                 }
@@ -204,6 +205,7 @@ exit $LASTEXITCODE
         $runtime = Get-Content -LiteralPath $result.ConfigCapture -Raw | ConvertFrom-Json -AsHashtable
         $runtime.mcpServers.offline.allowedTools | Should -Be @('echo')
         $runtime.mcpServers.offline.disabledTools | Should -Be @('delete_*')
+        $runtime.mcpServers.offline.elicitation.action | Should -BeExactly 'ask'
         $runtime.mcpServers.untouched.url | Should -BeExactly 'http://127.0.0.1:1/not-contacted'
         $runtime.mcpServers.untouched.headers.Example | Should -BeExactly 'not-a-secret'
         Test-Path -LiteralPath (Get-Content -LiteralPath ($result.ConfigCapture + '.path') -Raw) | Should -BeFalse

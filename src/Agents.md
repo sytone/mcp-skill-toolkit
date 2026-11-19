@@ -33,6 +33,7 @@ and its local protocol test server. Do not edit generated skills.
 | `McpCli/Output.cs` | Text, schema, ANSI, and result formatting |
 | `McpCli/McpConnection.cs`, `Retry.cs` | Filtered connections, metadata, retry budgets |
 | `McpCli/RpcConnection.cs` | MCP initialization, JSON-RPC correlation, server requests |
+| `McpCli/ElicitationPolicy.cs`, `ElicitationBroker.cs` | Opt-in form responses and bounded single-use approval continuations, without tool replay |
 | `McpCli/StdioTransport.cs`, `HttpTransport.cs` | Child processes and Streamable HTTP/SSE |
 | `McpCli/Daemon.cs` | Per-user connection caching over framed named pipes |
 | `McpCli/OutputSchema.cs` | Cached structured-output validation |

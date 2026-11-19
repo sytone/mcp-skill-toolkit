@@ -10,10 +10,13 @@ namespace McpCli;
 
 public static class Daemon
 {
+    private const string WorkerProtocolVersion = "2";
+
     public static string PipeName(string name, ServerConfig config, RuntimeSettings settings, string? applicationDirectory = null)
     {
         var identity = string.Join('\n', Environment.UserName, settings.HomeDirectory,
-            applicationDirectory ?? AppContext.BaseDirectory, settings.WorkingDirectory, Cli.Version, name, config.Hash());
+            applicationDirectory ?? AppContext.BaseDirectory, settings.WorkingDirectory, Cli.Version,
+            WorkerProtocolVersion, name, config.Hash());
         return "mcp-cli-csharp-" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..40];
     }
 
@@ -47,6 +50,11 @@ public static class Daemon
     private static async Task SpawnAsync(string pipeName, string name, ServerConfig config,
         RuntimeSettings settings, CancellationToken cancellationToken)
     {
+        if (OperatingSystem.IsWindows())
+        {
+            await SpawnWindowsAsync(pipeName, name, config, settings, cancellationToken);
+            return;
+        }
         var executable = Environment.ProcessPath ?? throw new IOException("Cannot determine CLI executable path");
         var arguments = new List<string>();
         if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
@@ -93,6 +101,61 @@ public static class Daemon
         }
     }
 
+    private static async Task SpawnWindowsAsync(string pipeName, string name, ServerConfig config,
+        RuntimeSettings settings, CancellationToken cancellationToken)
+    {
+        var startupName = "mcp-cli-startup-" + Guid.NewGuid().ToString("N");
+        await using var pipe = new NamedPipeServerStream(startupName, PipeDirection.InOut, 1,
+            PipeTransmissionMode.Byte, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly | PipeOptions.FirstPipeInstance);
+        var executable = Environment.ProcessPath ?? throw new IOException("Cannot determine CLI executable path");
+        // ShellExecute avoids inheriting the calling PowerShell host's extra pipe
+        // handles. Bootstrap config and diagnostics use a private pipe, never argv.
+        var start = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = settings.WorkingDirectory
+        };
+        if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+            start.ArgumentList.Add(Path.Combine(AppContext.BaseDirectory, "mcp-cli.dll"));
+        foreach (var argument in new[] { "--daemon-pipe", startupName, name }) start.ArgumentList.Add(argument);
+        using var process = Process.Start(start) ?? throw new IOException("Could not start daemon");
+        using var startup = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        startup.CancelAfter(5000);
+        var ready = false;
+        try
+        {
+            await pipe.WaitForConnectionAsync(startup.Token);
+            using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
+            try
+            {
+                await pipe.WriteAsync(Encoding.UTF8.GetBytes(McpJson.Serialize(config.Value) + "\n"), startup.Token);
+                while (await reader.ReadLineAsync(startup.Token).AsTask().WaitAsync(startup.Token) is { } line)
+                {
+                    if (line == "DAEMON_READY") { ready = true; break; }
+                    if (McpJson.Parse(line) is JsonObject message && message["diagnostic"] is { } diagnostic)
+                        settings.Diagnostics(diagnostic.GetValue<string>());
+                    else throw new InvalidDataException("Invalid daemon startup response");
+                }
+            }
+            catch (IOException error)
+            {
+                settings.Debug($"Daemon bootstrap closed: {error.Message}; checking for a concurrent worker");
+            }
+            if (!ready) await RequestAsync(pipeName, "ping", null, null, settings, 5000, startup.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException("Daemon spawn timeout");
+        }
+        finally
+        {
+            if (!ready && !process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync(CancellationToken.None);
+            }
+        }
+    }
+
     private static async Task ForwardErrorsAsync(StreamReader reader, RuntimeSettings settings, CancellationToken token)
     {
         try
@@ -108,7 +171,7 @@ public static class Daemon
     }
 
     public static async Task<JsonNode?> RequestAsync(string pipeName, string type, string? tool, JsonNode? args,
-        RuntimeSettings settings, int timeoutMs, CancellationToken cancellationToken)
+        RuntimeSettings settings, int timeoutMs, CancellationToken cancellationToken, int? connectTimeoutMs = null)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(timeoutMs);
@@ -116,7 +179,7 @@ public static class Daemon
             PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
         try
         {
-            await pipe.ConnectAsync(timeout.Token);
+            await pipe.ConnectAsync(connectTimeoutMs ?? timeoutMs, timeout.Token);
             using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
             using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
             var id = Guid.NewGuid().ToString("N");
@@ -135,6 +198,7 @@ public static class Daemon
                     continue;
                 }
                 if (response["id"]?.ToString() != id) throw new IOException("Invalid response ID from daemon");
+                if (response["approval"] is JsonObject approval) throw new ApprovalRequiredException(approval);
                 if (response["success"]?.GetValue<bool>() != true)
                     throw new IOException(response["error"]?["message"]?.GetValue<string>() ?? "Daemon request failed");
                 return response["data"]?.DeepClone();
@@ -148,7 +212,7 @@ public static class Daemon
     }
 
     public static async Task<int> RunAsync(string pipeName, string name, ServerConfig config,
-        RuntimeSettings settings, CancellationToken cancellationToken)
+        RuntimeSettings settings, CancellationToken cancellationToken, Action? ready = null)
     {
         if (pipeName != PipeName(name, config, settings))
             throw new InvalidDataException("Daemon endpoint does not match server configuration");
@@ -157,6 +221,7 @@ public static class Daemon
             NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly | (first ? PipeOptions.FirstPipeInstance : PipeOptions.None));
         var listener = NewListener(true);
+        await using var approvals = new ElicitationBroker(name, settings, lifetime.Token);
         McpConnection? connection = null;
         var subscribers = new ConcurrentDictionary<Guid, Channel<JsonObject>>();
         var requests = new ConcurrentDictionary<Guid, Task>();
@@ -165,21 +230,25 @@ public static class Daemon
         Task? idleTask = null;
         try
         {
-            connection = await McpConnection.ConnectDirectAsync(name, config, settings, lifetime.Token);
+            connection = await McpConnection.ConnectDirectAsync(name, config, settings, lifetime.Token, approvals);
             settings.Diagnostics = message =>
             {
                 foreach (var channel in subscribers.Values)
                     channel.Writer.TryWrite(new JsonObject { ["diagnostic"] = message });
             };
-            Console.Error.WriteLine("DAEMON_READY");
-            Console.WriteLine("DAEMON_READY");
+            if (ready is null)
+            {
+                Console.Error.WriteLine("DAEMON_READY");
+                Console.WriteLine("DAEMON_READY");
+            }
+            else ready();
             idleTask = Task.Run(async () =>
             {
                 using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(Math.Min(500, settings.DaemonTimeoutMs)));
                 try
                 {
                     while (await timer.WaitForNextTickAsync(lifetime.Token))
-                        if (Volatile.Read(ref active) == 0 &&
+                        if (Volatile.Read(ref active) == 0 && !approvals.HasPending &&
                             Environment.TickCount64 - Interlocked.Read(ref lastActivity) >= settings.DaemonTimeoutMs)
                             await lifetime.CancelAsync();
                 }
@@ -235,6 +304,16 @@ public static class Daemon
                             "listTools" => new JsonArray((await connection.ListToolsAsync(requestLifetime.Token, retryOptions)).Select(t =>
                                 (JsonNode)new JsonObject { ["name"] = t.Name, ["description"] = t.Description,
                                     ["inputSchema"] = t.InputSchema.DeepClone() }).ToArray()),
+                            "callTool" when config.Elicitation?.Action == "ask" => await approvals.CallAsync(
+                                request["toolName"]?.GetValue<string>() ?? throw new InvalidDataException("toolName required"),
+                                token => connection.CallToolAsync(request["toolName"]!.GetValue<string>(),
+                                    request["args"]?.DeepClone() ?? new JsonObject(), token,
+                                    new RetryOptions(timeoutMs, 0, retryOptions.BaseDelayMs)),
+                                timeoutMs, requestLifetime.Token),
+                            "approve" => await approvals.ResumeAsync(
+                                request["toolName"]?.GetValue<string>() ?? throw new InvalidDataException("toolName required"),
+                                request["args"]?["approvalId"]?.GetValue<string>() ?? throw new InvalidDataException("approvalId required"),
+                                ElicitationPolicy.Parse(request["args"]?["response"]), requestLifetime.Token),
                             "callTool" => await connection.CallToolAsync(
                                 request["toolName"]?.GetValue<string>() ?? throw new InvalidDataException("toolName required"),
                                 request["args"]?.DeepClone() ?? new JsonObject(), requestLifetime.Token, retryOptions),
@@ -243,6 +322,10 @@ public static class Daemon
                         };
                         response = new JsonObject { ["id"] = request["id"]?.DeepClone(), ["success"] = true, ["data"] = data };
                         if (type == "close") lifetime.CancelAfter(100);
+                    }
+                    catch (ApprovalRequiredException approval)
+                    {
+                        response = new JsonObject { ["id"] = request?["id"]?.DeepClone(), ["approval"] = approval.Request };
                     }
                     catch (Exception error)
                     {
@@ -293,6 +376,7 @@ public static class Daemon
             await listener.DisposeAsync();
             await Task.WhenAll(requests.Values);
             if (idleTask is not null) await idleTask;
+            await approvals.DisposeAsync();
             if (connection is not null) await McpConnection.SafeCloseAsync(connection, settings);
         }
         return 0;

@@ -43,6 +43,7 @@ Describe 'Offline source integration and safety boundaries' {
         $OutputDir = Join-Path $script:IntegrationRoot 'dist'
         $McpConfigPath = Join-Path $script:IntegrationRoot 'mcp_servers.json'
         $McpCliPath = $null
+        $McpCliBackend = $null
         $SelectedServerNames = 'everything'
         $SkipDiscovery = $true
         $DiscoveryTimeoutSeconds = 1

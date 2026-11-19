@@ -75,6 +75,7 @@ is the tested host, not a claim of verified Linux/macOS compatibility.
 | stdio | Newline JSON-RPC, UTF-8, inherited/configured environment, working directory, native and Windows batch commands |
 | HTTP | Streamable HTTP POST/GET, JSON/batch responses, SSE framing, session/version headers, resumable event IDs |
 | MCP | Version negotiation, initialized notification, correlated responses, ping replies, unsupported-request errors |
+| Elicitation extension | Opt-in per-server form responses; `ask` retains a bounded pending call for single-use approval without replay |
 | Runtime | Limited concurrent discovery, transient-error retries with backoff/jitter and a timeout budget |
 | Cached connections | Lazy per-server worker, config fingerprinting, readiness check, direct fallback, idle shutdown |
 | Cached tool metadata | Structured output-schema checks and required-task rejection after `tools/list` |
@@ -112,6 +113,38 @@ Some upstream README examples are stale. In the pinned source:
   streams remain open for subsequent responses and notifications. Numeric
   string response IDs are correlated as in the upstream SDK, and JSON-RPC
   error codes are not restricted to signed 32-bit values.
+
+### Form elicitation extension
+
+The optional `mcpServers.<server>.elicitation` configuration is a local
+extension, not upstream v0.3.0 behavior. Actions are `ask`, `accept`, `decline`,
+and `cancel`; only `accept` accepts optional `content`. Policies advertise
+`elicitation.form` and never URL support. Absent policies preserve upstream
+initialization and unsupported-method behavior.
+
+`ask` requires a cached worker and serializes the server to one active tool
+call. A call needing input prints JSON `status: "approval_required"` with
+`approvalId`, server, tool, and the original form request, and exits **4**.
+Resume it with:
+
+```powershell
+mcp-cli -c .\my-mcp-servers.json approve my-server my-tool <approvalId> accept '{"approved":true}'
+# decline/cancel need no form content
+mcp-cli -c .\my-mcp-servers.json approve my-server my-tool <approvalId> cancel '{}'
+```
+
+Use the actual requested schema, not the illustrative `approved` field.
+Answers are validated before sending; invalid content does not consume the ID.
+IDs are single-use and bound to the existing worker/configuration/tool, expire
+within the original `MCP_TIMEOUT`, and never trigger reconnection or replay.
+The pending call prevents idle shutdown. Ask-mode calls do not retry tools;
+normal upstream retry behavior remains unchanged elsewhere.
+
+Static `accept` opts into unattended responses for every compatible request
+from that server, not a new interactive prompt. No schema defaults or missing
+answers are invented. The [toolkit guide](../docs/creating-skills.md#elicitation-and-approval-defaults-net-backend)
+documents generated-script parameters and operational limits. Native server
+permissions and action policies remain authoritative.
 
 ### Environment variables
 

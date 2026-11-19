@@ -166,6 +166,17 @@ Do not edit generated scripts. Change `psakefile.ps1` and regenerate them.
 The current runner combines CLI output streams; callers should not assume its
 stdout is always a single JSON document, especially on errors.
 
+### Server approval requests
+
+The .NET backend supports per-server MCP form elicitation defaults in
+`servers.json`. Set `"elicitation": { "action": "ask" }` to return
+`approval_required` (exit 4), let the agent ask the user, then resume the exact
+pending call with the script's `-ApprovalId`, `-ApprovalAction`, and
+`-ApprovalJson` parameters. Explicit unattended `accept`/`decline`/`cancel`
+defaults are also available. Tool discovery cannot predict runtime approvals.
+See [elicitation configuration and approval handling](docs/creating-skills.md#elicitation-and-approval-defaults-net-backend)
+for examples, timeout/caching requirements, and auto-approval risks.
+
 ### Session-local discovery
 
 For stdio servers, the runner automatically inserts a generated bridge between

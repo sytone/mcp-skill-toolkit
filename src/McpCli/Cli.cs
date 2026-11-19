@@ -57,8 +57,30 @@ public static class Cli
 
             var name = args.Server!;
             if (!config.TryGetValue(name, out var server)) throw CliError.ServerNotFound(name, config.Keys);
-            var payload = args.Command == "call" ?
+            var payload = args.Command is "call" or "approve" ?
                 await ReadArgumentsAsync(args.Json, input, inputRedirected, settings, cancellationToken) : null;
+            if (args.Command == "approve")
+            {
+                if (server.Elicitation?.Action != "ask" || !settings.DaemonEnabled)
+                    throw new CliError(2, "APPROVAL_UNAVAILABLE", "Resuming approval requires elicitation action ask and cached workers");
+                var response = new JsonObject { ["action"] = args.ApprovalAction };
+                if (args.ApprovalAction == "accept" || payload is not JsonObject { Count: 0 })
+                    response["content"] = payload?.DeepClone();
+                ElicitationPolicy.Parse(response);
+                try
+                {
+                    var result = await Daemon.RequestAsync(Daemon.PipeName(name, server, settings), "approve", args.Tool,
+                        new JsonObject { ["approvalId"] = args.ApprovalId, ["response"] = response },
+                        settings, settings.TimeoutMs, cancellationToken, connectTimeoutMs: 1000);
+                    await output.WriteLineAsync(Output.ToolResult(result));
+                    return 0;
+                }
+                catch (ApprovalRequiredException) { throw; }
+                catch (Exception cause) when (cause is not OperationCanceledException)
+                {
+                    throw CliError.ToolExecution(name, args.Tool!, cause.Message);
+                }
+            }
             IMcpConnection connection;
             try { connection = await McpConnection.ConnectAsync(name, server, settings, cancellationToken); }
             catch (Exception cause) when (cause is not OperationCanceledException) { throw CliError.Connection(name, cause.Message); }
@@ -82,6 +104,7 @@ public static class Cli
                     var result = await connection.CallToolAsync(args.Tool!, payload, cancellationToken);
                     await output.WriteLineAsync(Output.ToolResult(result));
                 }
+                catch (ApprovalRequiredException) { throw; }
                 catch (Exception cause) when (cause is not OperationCanceledException)
                 {
                     string[]? available = null;
@@ -97,6 +120,11 @@ public static class Cli
             }
             finally { await McpConnection.SafeCloseAsync(connection, settings); }
             return 0;
+        }
+        catch (ApprovalRequiredException approval)
+        {
+            await output.WriteLineAsync(McpJson.Serialize(approval.Request));
+            return 4;
         }
         catch (CliError failure) { await error.WriteLineAsync(failure.Message); return failure.ExitCode; }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -191,6 +219,8 @@ public static class Cli
           mcp-cli [options] grep <pattern>               Search tools by glob pattern
           mcp-cli [options] call <server> <tool>         Call tool (reads JSON from stdin if no args)
           mcp-cli [options] call <server> <tool> <json>  Call tool with JSON arguments
+          mcp-cli [options] approve <server> <tool> <approvalId> <accept|decline|cancel> [json]
+                                                        Resume a pending call, never replay it
 
         Formats (both work):
           mcp-cli info server tool                       Space-separated
@@ -207,6 +237,7 @@ public static class Cli
         Output:
           mcp-cli/info/grep        Human-readable text to stdout
           call                    Text content, or JSON for non-text results
+          Approval needed         JSON status approval_required, exit code 4
           Errors                  Always to stderr
 
         Examples:

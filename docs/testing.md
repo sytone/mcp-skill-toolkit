@@ -41,6 +41,9 @@ installed skills.
 - Source-only packaging, including planted fake credentials that must stay out.
 - The local C# CLI's MSTest coverage, including child-process execution and
   local stdio/loopback HTTP protocol fixtures.
+- Configured form elicitation, accepted-content validation, explicit
+  decline/cancel, runtime approval-needed results, and single-use cached
+  continuations with no tool replay or expiry recovery.
 
 Pester and protocol-fixture temporaries stay in `.test-tmp/`; .NET build output
 is kept under ignored `src/**/bin` and `src/**/obj` directories and excluded
