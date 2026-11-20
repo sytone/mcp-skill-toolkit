@@ -76,3 +76,75 @@ fail. The folder is ignored by Git and excluded from source packages.
 
 Use `-OutputDirectory` to choose another report location. Without `-Coverage`,
 the runner executes all tests but does not measure or enforce coverage.
+
+
+## Retained daemon endpoint collision regression (Windows)
+
+`DaemonTests.HeldUnresponsiveEndpointFallbackDoesNotReportFatalDaemonFailure`
+is an active regression for successful, quiet direct fallback. It starts the
+real worktree CLI against the local stdio fixture, with debug off
+and retries disabled. Before launch, the test holds a current-user-only,
+asynchronous named pipe with `FirstPipeInstance` at the exact endpoint derived
+from the server config, workspace working directory, and CLI application
+directory. The holder never accepts or answers requests. There is no sleep or
+random scheduling used to trigger the collision.
+
+The initial readiness ping cannot succeed. The worker's first-instance pipe
+creation fails, and direct fallback still completes the tool call. The test
+first checks exit code 0, valid state JSON with `calls = 1`, the fixture working
+directory and PID, exactly one `tools/call` in the shared request log, and only
+one fixture start. It then requires no fatal `Daemon failed:` diagnostic and
+clean stderr. Before the runtime fix, this final check failed with:
+
+```text
+Daemon failed: Access to the path is denied.
+```
+
+The child worker now reports its top-level failure only with `MCP_DEBUG`.
+The parent owns the terminal error if direct fallback also fails. This does
+not buffer or filter server stderr: authentication prompts and server errors
+still stream through the existing diagnostic path. The whole operating system
+error sentence is not asserted because its wording can vary. Held-endpoint
+tests use MSTest's Windows OS condition and run normally on Windows.
+
+Controls in the same file check that `MCP_NO_DAEMON=1` succeeds with clean
+stderr while the same endpoint is held, and that a healthy debug-off daemon
+serves `info` then a separate `state` CLI invocation on the same connection
+with clean stderr. Further cases retain the child diagnosis with debug enabled,
+check actionable connection failure (exit 3) and tool failure (exit 2) after
+fallback, and verify no tool replay. Server stderr is forwarded exactly once
+both during healthy worker startup and direct fallback, even when the server
+message contains `Daemon failed:`. Healthy concurrent startup must also have
+clean stderr and share one connection. All these CLI calls use
+`TestWorkspace.RunAsync`, whose
+30-second deadline bounds stdin, process exit, stdout, and stderr. Held pipe
+handles close before workspace cleanup, even when an assertion fails. Worker
+configurations are tracked for endpoint-based cleanup; no process-name kills
+are used.
+
+Run from the repository root in PowerShell 7 with the .NET 10 SDK. Leave
+`MCP_CLI_TEST_EXECUTABLE` unset to test only the worktree build:
+
+```powershell
+dotnet build ./src/McpCli.slnx --configuration Release
+$filter = 'FullyQualifiedName~HeldUnresponsiveEndpoint|FullyQualifiedName~HealthyDaemonWithDebugDisabled|FullyQualifiedName~ServerStderrIsForwardedOnce|FullyQualifiedName~ConcurrentStartupAndRequestsUseOneDaemon'
+# Three independent test-host runs, including controls and diagnostic cases:
+1..3 | ForEach-Object {
+    dotnet test ./src/McpCli.slnx --configuration Release --no-build --no-restore --filter $filter --logger "trx;LogFileName=focused-$_.trx" --results-directory ./test-results/daemon-fallback-fix *> "./test-results/daemon-fallback-fix/focused-$_.log"
+    Write-Host "Run $_ exit code: $LASTEXITCODE"
+}
+# Run the complete C# suite and the complete repository coverage entry point:
+dotnet test ./src/McpCli.slnx --configuration Release --no-build --no-restore --logger 'trx;LogFileName=full-dotnet.trx' --results-directory ./test-results/daemon-fallback-fix *> ./test-results/daemon-fallback-fix/full-dotnet.log
+pwsh -NoProfile -File ./scripts/Invoke-Tests.ps1 -Coverage -OutputDirectory ./test-results/daemon-fallback-fix *> ./test-results/daemon-fallback-fix/repository-coverage.log
+```
+
+Create `test-results/daemon-fallback-fix` before redirecting output if it
+does not exist. Each focused run should report 9 passed, 0 failed, and 0 skipped
+on Windows. Do not disable tests or lower the coverage threshold. Raw logs,
+TRX files, and Pester coverage reports stay under ignored `test-results/`.
+
+**Limits:** this is a deliberately held, unresponsive endpoint. It does not
+model two healthy workers racing to start. That remains covered separately by
+`ConcurrentStartupAndRequestsUseOneDaemon`. This reproduction shows one way to
+produce the diagnostic; it does not prove the cause of any Teams incident or
+establish live-service compatibility.
