@@ -26,7 +26,13 @@ if (args.Length > 0 && args[0] == "--daemon")
         Configuration.ValidateServer(args[2], value);
         return await Daemon.RunAsync(args[1], args[2], new(value), settings, cancellation.Token);
     }
-    catch (Exception error) { Console.Error.WriteLine($"Daemon failed: {error.Message}"); return 1; }
+    catch (Exception error)
+    {
+        // The parent can recover by using a competing worker or a direct connection.
+        // It owns the terminal error if fallback also fails. Server stderr is still streamed.
+        settings.Debug($"Daemon failed: {error.Message}");
+        return 1;
+    }
 }
 var result = await Cli.RunAsync(args, Console.In, Console.Out, Console.Error, Console.IsInputRedirected,
     !Console.IsOutputRedirected && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NO_COLOR")),
